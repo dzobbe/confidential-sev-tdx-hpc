@@ -1,0 +1,29 @@
+# Configuration for TEE HPC Tutorial
+# Azure Attestation Service Configuration
+azure:
+  attestation_endpoint: "https://your-attestation-instance.attest.azure.net"
+  tenant_id: "your-tenant-id"
+  client_id: "your-client-id"
+  # For production, use environment variables or Azure Key Vault
+
+# Server Configuration
+servers:
+  sev:
+    host: "sev-vm.example.com"
+    port: 8080
+    tee_type: "SEV"
+  tdx:
+    host: "tdx-vm.example.com"
+    port: 8080
+    tee_type: "TDX"
+
+# Client Configuration
+client:
+  port: 5000
+  timeout: 300  # seconds
+
+# HPC Job Configuration
+hpc_job:
+  sync_interval: 1.0  # seconds between sync points
+  max_iterations: 100
+  chunk_size: 1000  # data chunk size for processing
