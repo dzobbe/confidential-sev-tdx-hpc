@@ -254,13 +254,28 @@ class HPCJob:
                                 if is_valid:
                                     session.peer_quote = peer_quote
                                     session.peer_verified = True
-                                    session.session_key = session._derive_session_key(session.local_quote, peer_quote)
+                                    derived_key = session._derive_session_key(session.local_quote, peer_quote)
+                                    if derived_key is None:
+                                        logger.error(f"Job {self.job_id}: Failed to derive session key")
+                                        return False
+                                    session.session_key = derived_key
                                     logger.info(f"Job {self.job_id}: Mutual attestation established")
+                                    logger.debug(f"Job {self.job_id}: Session state - peer_verified={session.peer_verified}, session_key={'set' if session.session_key else 'None'}, is_ready={session.is_session_ready()}")
+                                    
+                                    # Verify session is ready immediately after establishment
+                                    # Use self.mutual_attestation_session to ensure we're checking the same object
+                                    if not self.mutual_attestation_session.is_session_ready():
+                                        logger.error(f"Job {self.job_id}: Session not ready immediately after establishment!")
+                                        logger.error(f"Job {self.job_id}: session.peer_verified={session.peer_verified}, session.session_key={'set' if session.session_key else 'None'}")
+                                        logger.error(f"Job {self.job_id}: self.mutual_attestation_session.peer_verified={self.mutual_attestation_session.peer_verified}, self.mutual_attestation_session.session_key={'set' if self.mutual_attestation_session.session_key else 'None'}")
+                                        logger.error(f"Job {self.job_id}: session object id={id(session)}, self.mutual_attestation_session object id={id(self.mutual_attestation_session)}")
+                                        return False
                                 else:
                                     logger.error(f"Job {self.job_id}: Failed to verify peer quote: {result.get('error')}")
                                     return False
                             else:
                                 logger.warning(f"Job {self.job_id}: Peer response missing quote")
+                                return False
                         else:
                             error_msg = peer_response.get('error', 'Peer verification failed')
                             logger.error(f"Job {self.job_id}: Peer verification failed: {error_msg}")
@@ -277,6 +292,8 @@ class HPCJob:
             # Check if session is ready
             if not self.mutual_attestation_session.is_session_ready():
                 logger.warning(f"Job {self.job_id}: Mutual attestation session not ready")
+                logger.debug(f"Job {self.job_id}: Session state check - peer_verified={self.mutual_attestation_session.peer_verified}, session_key={'set' if self.mutual_attestation_session.session_key else 'None'}")
+                logger.debug(f"Job {self.job_id}: Session object id: {id(self.mutual_attestation_session)}")
                 return False
             
             # Prepare sync data
