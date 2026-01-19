@@ -170,28 +170,17 @@ class TEEHPCClient:
         print("\n[Step 3] Submitting jobs to TEE VMs...")
         
         job_results = {}
-        peer_urls = {}
-        
-        # Determine peer URLs for each node
-        if 'SEV' in self.enabled_nodes and 'TDX' in self.enabled_nodes:
-            peer_urls['SEV'] = self.tdx_server_url
-            peer_urls['TDX'] = self.sev_server_url
-        else:
-            # Single node - no peer
-            peer_urls[self.enabled_nodes[0]] = None
         
         # Submit to each enabled node
         for node_type in self.enabled_nodes:
             server_url = self.sev_server_url if node_type == 'SEV' else self.tdx_server_url
-            peer_url = peer_urls.get(node_type)
             
             job_result = self._submit_to_server(
                 server_url,
                 job_id,
                 node_data[node_type],
                 parameters,
-                max_iterations,
-                peer_url
+                max_iterations
             )
             
             job_results[node_type] = job_result
@@ -215,7 +204,7 @@ class TEEHPCClient:
         }
     
     def _submit_to_server(self, server_url: str, job_id: str, data: List[Dict],
-                          parameters: Dict, max_iterations: int, peer_url: str) -> Dict:
+                          parameters: Dict, max_iterations: int) -> Dict:
         """
         Submit job to a specific server
         
@@ -225,7 +214,6 @@ class TEEHPCClient:
             data: Job data
             parameters: Job parameters
             max_iterations: Maximum iterations
-            peer_url: Peer server URL
             
         Returns:
             Submission result
@@ -237,8 +225,7 @@ class TEEHPCClient:
                     'job_id': job_id,
                     'data': data,
                     'parameters': parameters,
-                    'max_iterations': max_iterations,
-                    'peer_url': peer_url
+                    'max_iterations': max_iterations
                 },
                 timeout=30
             )
