@@ -62,6 +62,9 @@ class MutualAttestationSession:
         Returns:
             Tuple of (is_valid, error_message)
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
             # Extract peer quote
             peer_quote_b64 = peer_request.get('quote')
@@ -70,6 +73,11 @@ class MutualAttestationSession:
             
             self.peer_quote = base64.b64decode(peer_quote_b64)
             peer_tee_type = peer_request.get('tee_type')
+            
+            # Log nonce details for debugging
+            logger.info(f"Verifying peer attestation: TEE type={peer_tee_type}, nonce length={len(nonce) if nonce else 0}, quote length={len(self.peer_quote)}")
+            logger.debug(f"Nonce (hex): {nonce.hex() if nonce else 'None'}")
+            logger.debug(f"Peer quote (first 50 bytes hex): {self.peer_quote[:50].hex() if len(self.peer_quote) >= 50 else self.peer_quote.hex()}")
             
             # Verify quote with Azure Attestation Service
             is_valid, result = self.azure_verifier.verify_quote(
@@ -82,11 +90,16 @@ class MutualAttestationSession:
                 self.peer_verified = True
                 # Generate session key from both quotes
                 self.session_key = self._derive_session_key(self.local_quote, self.peer_quote)
+                logger.info("Peer attestation verification successful")
                 return True, ""
             else:
-                return False, result.get('error', 'Attestation verification failed')
+                error_msg = result.get('error', 'Attestation verification failed')
+                logger.error(f"Peer attestation verification failed: {error_msg}")
+                logger.debug(f"Verification result: {result}")
+                return False, error_msg
                 
         except Exception as e:
+            logger.error(f"Error verifying peer attestation: {str(e)}", exc_info=True)
             return False, f"Error verifying peer attestation: {str(e)}"
     
     def create_attestation_response(self, verified: bool, error: str = "") -> Dict:

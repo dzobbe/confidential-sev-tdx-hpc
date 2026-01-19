@@ -293,15 +293,30 @@ def verify_peer_attestation():
         # Use the same nonce from the request, or derive deterministically from job_id
         nonce_b64 = data.get('nonce')
         if nonce_b64:
-            nonce = base64.b64decode(nonce_b64)
+            try:
+                nonce = base64.b64decode(nonce_b64)
+                logger.info(f"Extracted nonce from request: length={len(nonce)}, hex={nonce.hex()[:32]}...")
+            except Exception as e:
+                logger.error(f"Failed to decode nonce from request: {e}")
+                # Fallback: use deterministic nonce based on job_id
+                nonce = hashlib.sha256(job_id.encode()).digest()[:32]
+                logger.warning(f"Using fallback deterministic nonce from job_id: {nonce.hex()[:32]}...")
         else:
             # Fallback: use deterministic nonce based on job_id
             nonce = hashlib.sha256(job_id.encode()).digest()[:32]
+            logger.warning(f"No nonce in request, using deterministic nonce from job_id: {nonce.hex()[:32]}...")
         
+        # Log request details for debugging
+        logger.info(f"Verifying peer attestation request: session_id={session_id}, job_id={job_id}, peer_tee_type={peer_tee_type}")
+        logger.debug(f"Request data keys: {list(data.keys())}")
+        logger.debug(f"Nonce in request: {nonce_b64 is not None}, Nonce length: {len(nonce)}")
+        
+        logger.info(f"Generating local quote for verification endpoint: TEE type={TEE_TYPE}, nonce length={len(nonce)}")
         if TEE_TYPE.upper() == 'SEV':
             local_quote = AttestationQuoteGenerator.generate_sev_quote(nonce)
         else:
             local_quote = AttestationQuoteGenerator.generate_tdx_quote(nonce)
+        logger.debug(f"Local quote generated: length={len(local_quote)}")
         
         # Create session if not exists
         if job_id not in mutual_attestation_sessions:
@@ -319,7 +334,8 @@ def verify_peer_attestation():
         
         session = mutual_attestation_sessions[job_id]
         
-        # Verify peer attestation
+        # Verify peer attestation - CRITICAL: Use the same nonce that was used to generate the peer's quote
+        logger.info(f"Verifying peer's quote with nonce: length={len(nonce)}, hex={nonce.hex()[:32]}...")
         is_valid, error = session.verify_peer_attestation(data, nonce)
         
         if is_valid:

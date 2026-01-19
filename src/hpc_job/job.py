@@ -201,8 +201,10 @@ class HPCJob:
                 
                 # Use deterministic nonce based on job_id so both sides use the same nonce
                 nonce = hashlib.sha256(self.job_id.encode()).digest()[:32]
+                logger.info(f"Job {self.job_id}: Generated nonce for mutual attestation: length={len(nonce)}, hex={nonce.hex()[:32]}...")
                 
                 # Generate local quote
+                logger.info(f"Job {self.job_id}: Generating local quote with TEE type={self.tee_type}, nonce length={len(nonce)}")
                 if self.tee_type.upper() == 'SEV':
                     local_quote = self.quote_generator.generate_sev_quote(nonce)
                 elif self.tee_type.upper() == 'TDX':
@@ -210,6 +212,7 @@ class HPCJob:
                 else:
                     logger.error(f"Job {self.job_id}: Unknown TEE type: {self.tee_type}")
                     return False
+                logger.debug(f"Job {self.job_id}: Local quote generated: length={len(local_quote)}")
                 
                 # Create mutual attestation session
                 session = MutualAttestationSession(

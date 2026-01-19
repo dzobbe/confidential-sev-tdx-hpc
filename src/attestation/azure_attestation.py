@@ -166,17 +166,27 @@ class AzureAttestationVerifier:
                     error_detail = response.json()
                     error_msg += f": {error_detail}"
                     logger.error(f"Azure Attestation Service error response: {error_detail}")
+                    logger.error(f"Full error response: {json.dumps(error_detail, indent=2)}")
                 except Exception as e:
                     error_msg += f": {response.text}"
                     logger.error(f"Azure Attestation Service error (non-JSON): {response.text[:500]}")
                     logger.debug(f"Failed to parse error response as JSON: {e}")
                 
+                # Log request details for debugging
                 logger.error(f"Attestation verification failed: {error_msg}")
+                logger.debug(f"Request details - TEE type: {tee_type}, Nonce provided: {nonce is not None}, Nonce length: {len(nonce) if nonce else 0}")
+                if nonce:
+                    logger.debug(f"Nonce (hex): {nonce.hex()}")
+                logger.debug(f"Quote length: {len(quote)}, Quote type: {type(quote)}")
+                logger.debug(f"Request URL: {attest_url}")
+                logger.debug(f"Request body keys: {list(request_body.keys())}")
+                
                 return False, {
                     'error': error_msg,
                     'is_valid': False,
                     'tee_type': tee_type,
-                    'status_code': response.status_code
+                    'status_code': response.status_code,
+                    'response_body': error_detail if 'error_detail' in locals() else response.text[:500]
                 }
             
             # Parse response

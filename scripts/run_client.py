@@ -5,6 +5,9 @@ Example client script to run HPC job on TEE VMs
 
 import sys
 import os
+import subprocess
+import re
+from urllib.parse import urlparse
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
