@@ -173,7 +173,6 @@ class AzureAttestationVerifier:
                     logger.debug(f"Failed to parse error response as JSON: {e}")
                 
                 # Log request details for debugging
-                logger.error(f"Attestation verification failed: {error_msg}")
                 logger.debug(f"Request details - TEE type: {tee_type}, Nonce provided: {nonce is not None}, Nonce length: {len(nonce) if nonce else 0}")
                 if nonce:
                     logger.debug(f"Nonce (hex): {nonce.hex()}")
