@@ -8,6 +8,8 @@ import time
 import threading
 import logging
 import requests
+import base64
+import uuid
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -15,9 +17,11 @@ from enum import Enum
 # Import attestation components
 try:
     from src.attestation.azure_attestation import AttestationQuoteGenerator
+    from src.attestation.mutual_attestation import MutualAttestationSession
 except ImportError:
     # Handle case where imports might fail during testing
     AttestationQuoteGenerator = None
+    MutualAttestationSession = None
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -94,6 +98,14 @@ class HPCJob:
         self.synced_state = {}  # State received from other nodes
         self.lock = threading.Lock()
         
+        # Attestation session management per peer node
+        # Maps node_url/node_id -> MutualAttestationSession
+        self.attestation_sessions: Dict[str, object] = {}
+        
+        # Note: We don't generate a quote here because quotes must be generated
+        # with a specific nonce that will be used for verification. Quotes are
+        # generated fresh during each sync operation with the appropriate nonce.
+        
         logger.info(f"Job {self.job_id} initialized on node {self.node_id} "
                    f"(total_nodes={self.total_nodes}, sync_enabled={self.sync_enabled})")
     
@@ -168,9 +180,60 @@ class HPCJob:
         
         return result
     
+    def _get_or_create_attestation_session(self, peer_identifier: str) -> Optional[object]:
+        """
+        Get or create mutual attestation session for a peer node
+        
+        Args:
+            peer_identifier: URL or node_id of the peer node
+            
+        Returns:
+            MutualAttestationSession if available, None otherwise
+        """
+        if peer_identifier in self.attestation_sessions:
+            return self.attestation_sessions[peer_identifier]
+        
+        # Create new session if we have the required components
+        # Note: We'll generate quotes dynamically during sync, so we don't need
+        # a pre-generated local_quote for the session initialization
+        if (MutualAttestationSession and self.azure_verifier and self.tee_type):
+            try:
+                session_id = f"{self.job_id}_{self.node_id}_{peer_identifier}"
+                # Create a placeholder session - we'll update it with quotes during sync
+                # For now, we'll create it without a local quote and update it later
+                # Note: MutualAttestationSession requires local_quote, so we'll need
+                # to generate a temporary one or modify the approach
+                import os
+                temp_nonce = os.urandom(32)
+                temp_quote = None
+                if self.quote_generator:
+                    try:
+                        if self.tee_type.upper() == 'SEV':
+                            temp_quote = self.quote_generator.generate_sev_quote(temp_nonce)
+                        elif self.tee_type.upper() == 'TDX':
+                            temp_quote = self.quote_generator.generate_tdx_quote(temp_nonce)
+                    except Exception:
+                        pass
+                
+                if temp_quote:
+                    session = MutualAttestationSession(
+                        local_tee_type=self.tee_type,
+                        local_quote=temp_quote,
+                        azure_verifier=self.azure_verifier,
+                        session_id=session_id
+                    )
+                    self.attestation_sessions[peer_identifier] = session
+                    return session
+            except Exception as e:
+                logger.warning(f"Failed to create attestation session for {peer_identifier}: {e}")
+                return None
+        
+        return None
+    
     def _sync_with_other_nodes(self, iteration: int, local_result: Dict) -> Optional[Dict]:
         """
         Synchronize data with other nodes for the current iteration
+        Includes attestation quote verification
         
         Args:
             iteration: Current iteration number
@@ -183,26 +246,91 @@ class HPCJob:
             return None
         
         try:
-            # Prepare sync data to send
+            # Generate nonce for attestation
+            import os
+            nonce = os.urandom(32)
+            
+            # Generate fresh attestation quote with this nonce for verification
+            attestation_quote = None
+            if self.quote_generator and self.tee_type:
+                try:
+                    if self.tee_type.upper() == 'SEV':
+                        attestation_quote = self.quote_generator.generate_sev_quote(nonce)
+                    elif self.tee_type.upper() == 'TDX':
+                        attestation_quote = self.quote_generator.generate_tdx_quote(nonce)
+                except Exception as e:
+                    logger.warning(f"Failed to generate attestation quote for sync: {e}")
+            
+            # Prepare sync data to send with attestation quote
             sync_data = {
                 'job_id': self.job_id,
                 'iteration': iteration,
                 'node_id': self.node_id,
                 'local_result': local_result,
-                'timestamp': time.time()
+                'timestamp': time.time(),
+                'nonce': base64.b64encode(nonce).decode()  # Include nonce for quote verification
             }
+            
+            # Add attestation quote if generated successfully
+            if attestation_quote:
+                sync_data['attestation_quote'] = base64.b64encode(attestation_quote).decode()
+                sync_data['tee_type'] = self.tee_type
             
             # Collect results from other nodes
             other_results = []
             for node_url in self.other_node_urls:
                 try:
+                    # Get or create attestation session for this peer
+                    session = self._get_or_create_attestation_session(node_url)
+                    
+                    # Add source URL to sync data so receiving node can identify us
+                    sync_data_with_source = sync_data.copy()
+                    # Note: We don't have our own URL here, but the receiving node
+                    # can identify us by node_id for attestation session management
+                    
                     response = requests.post(
                         f"{node_url}/job/{self.job_id}/sync",
-                        json=sync_data,
-                        timeout=5.0
+                        json=sync_data_with_source,
+                        timeout=10.0  # Increased timeout for attestation verification
                     )
+                    
                     if response.status_code == 200:
                         node_result = response.json()
+                        
+                        # Verify attestation quote from peer if present
+                        if session and node_result.get('attestation_quote'):
+                            peer_quote_b64 = node_result.get('attestation_quote')
+                            peer_tee_type = node_result.get('tee_type')
+                            
+                            try:
+                                peer_quote = base64.b64decode(peer_quote_b64)
+                                # Use the nonce we sent for verification
+                                is_valid, verify_result = self.azure_verifier.verify_quote(
+                                    quote=peer_quote,
+                                    tee_type=peer_tee_type,
+                                    nonce=nonce
+                                )
+                                
+                                if is_valid:
+                                    # Update session with verified peer quote
+                                    session.peer_quote = peer_quote
+                                    session.peer_verified = True
+                                    logger.debug(f"Verified attestation quote from {node_url}")
+                                else:
+                                    error_msg = verify_result.get('error', 'Attestation verification failed')
+                                    logger.warning(f"Attestation verification failed for {node_url}: {error_msg}")
+                                    # Continue but mark as unverified
+                                    node_result['attestation_verified'] = False
+                                    node_result['attestation_error'] = error_msg
+                            except Exception as e:
+                                logger.warning(f"Error verifying attestation from {node_url}: {e}")
+                                node_result['attestation_verified'] = False
+                                node_result['attestation_error'] = str(e)
+                        else:
+                            # No attestation quote provided
+                            logger.debug(f"No attestation quote provided by {node_url}")
+                            node_result['attestation_verified'] = False
+                        
                         other_results.append(node_result)
                         logger.debug(f"Synced with node at {node_url}: {node_result.get('node_id')}")
                     else:
@@ -215,14 +343,18 @@ class HPCJob:
             if other_results:
                 # Calculate global sum across all nodes
                 global_sum = local_result.get('local_sum', 0)
+                verified_nodes = 0
                 for node_result in other_results:
                     node_local_result = node_result.get('local_result', {})
                     global_sum += node_local_result.get('local_sum', 0)
+                    if node_result.get('attestation_verified', False):
+                        verified_nodes += 1
                 
                 aggregated = {
                     'global_sum': global_sum,
                     'nodes_participated': len(other_results) + 1,  # +1 for this node
                     'total_nodes': self.total_nodes,
+                    'verified_nodes': verified_nodes + 1,  # +1 for this node
                     'other_node_results': other_results
                 }
                 
@@ -241,6 +373,7 @@ class HPCJob:
     def receive_sync(self, sync_data: Dict) -> Dict:
         """
         Receive synchronization data from another node
+        Verifies attestation quote from the peer node
         
         Args:
             sync_data: Sync data from another node containing:
@@ -248,27 +381,75 @@ class HPCJob:
                 - iteration: Iteration number
                 - node_id: Source node identifier
                 - local_result: Local result from source node
+                - nonce: Nonce for attestation verification
+                - attestation_quote: Base64-encoded attestation quote (optional)
+                - tee_type: TEE type of source node (optional)
                 
         Returns:
-            This node's local result for the same iteration
+            This node's local result for the same iteration, including attestation quote
         """
         iteration = sync_data.get('iteration')
         source_node_id = sync_data.get('node_id')
+        source_node_url = sync_data.get('source_url')  # Optional: URL of source node
         
         logger.debug(f"Received sync from node {source_node_id} for iteration {iteration}")
+        
+        # Verify attestation quote from peer if provided
+        attestation_verified = False
+        attestation_error = None
+        
+        if sync_data.get('attestation_quote') and self.azure_verifier:
+            peer_quote_b64 = sync_data.get('attestation_quote')
+            peer_tee_type = sync_data.get('tee_type')
+            nonce_b64 = sync_data.get('nonce')
+            
+            if peer_tee_type and nonce_b64:
+                try:
+                    peer_quote = base64.b64decode(peer_quote_b64)
+                    nonce = base64.b64decode(nonce_b64)
+                    
+                    # Verify quote with Azure Attestation Service
+                    is_valid, verify_result = self.azure_verifier.verify_quote(
+                        quote=peer_quote,
+                        tee_type=peer_tee_type,
+                        nonce=nonce
+                    )
+                    
+                    if is_valid:
+                        attestation_verified = True
+                        logger.debug(f"Verified attestation quote from node {source_node_id}")
+                        
+                        # Store attestation session using node_id or URL as identifier
+                        session_identifier = source_node_url or source_node_id
+                        if session_identifier and MutualAttestationSession:
+                            session = self._get_or_create_attestation_session(session_identifier)
+                            if session:
+                                session.peer_quote = peer_quote
+                                session.peer_verified = True
+                    else:
+                        attestation_error = verify_result.get('error', 'Attestation verification failed')
+                        logger.warning(f"Attestation verification failed for node {source_node_id}: {attestation_error}")
+                except Exception as e:
+                    attestation_error = str(e)
+                    logger.warning(f"Error verifying attestation from node {source_node_id}: {e}")
+            else:
+                attestation_error = "Missing nonce or tee_type for attestation verification"
+        else:
+            logger.debug(f"No attestation quote provided by node {source_node_id}")
         
         # Return our local result for this iteration
         with self.lock:
             local_result = self.local_state.get(f'iter_{iteration}')
             if local_result:
-                return {
+                result = {
                     'node_id': self.node_id,
                     'local_result': local_result,
-                    'timestamp': time.time()
+                    'timestamp': time.time(),
+                    'attestation_verified': attestation_verified
                 }
             else:
                 # If we haven't processed this iteration yet, return current state
-                return {
+                result = {
                     'node_id': self.node_id,
                     'local_result': {
                         'iteration': iteration,
@@ -277,8 +458,33 @@ class HPCJob:
                         'data_chunks_count': len(self.data)
                     },
                     'timestamp': time.time(),
-                    'note': 'Iteration not yet processed'
+                    'note': 'Iteration not yet processed',
+                    'attestation_verified': attestation_verified
                 }
+            
+                # Generate fresh attestation quote with the nonce from the request
+            if sync_data.get('nonce') and self.quote_generator and self.tee_type:
+                try:
+                    nonce_b64 = sync_data.get('nonce')
+                    nonce = base64.b64decode(nonce_b64)
+                    
+                    if self.tee_type.upper() == 'SEV':
+                        quote = self.quote_generator.generate_sev_quote(nonce)
+                    elif self.tee_type.upper() == 'TDX':
+                        quote = self.quote_generator.generate_tdx_quote(nonce)
+                    else:
+                        quote = None
+                    
+                    if quote:
+                        result['attestation_quote'] = base64.b64encode(quote).decode()
+                        result['tee_type'] = self.tee_type
+                except Exception as e:
+                    logger.warning(f"Failed to generate attestation quote in receive_sync: {e}")
+            
+            if attestation_error:
+                result['attestation_error'] = attestation_error
+            
+            return result
     
     def get_status(self) -> Dict:
         """Get current job status"""

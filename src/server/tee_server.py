@@ -202,20 +202,27 @@ def get_job_results(job_id):
 def sync_job_data(job_id):
     """
     Synchronize job data with another node
+    Includes attestation quote verification
     
     Request body:
         {
             "job_id": "<job_id>",
             "iteration": <iteration_number>,
             "node_id": "<source_node_id>",
-            "local_result": {...}
+            "local_result": {...},
+            "nonce": "<base64_encoded_nonce>",
+            "attestation_quote": "<base64_encoded_quote>",  # Optional
+            "tee_type": "<SEV|TDX>"  # Optional
         }
     
     Response:
         {
             "node_id": "<this_node_id>",
             "local_result": {...},
-            "timestamp": "<timestamp>"
+            "timestamp": "<timestamp>",
+            "attestation_quote": "<base64_encoded_quote>",  # If available
+            "tee_type": "<SEV|TDX>",  # If available
+            "attestation_verified": <bool>
         }
     """
     if job_id not in active_jobs:
@@ -225,11 +232,23 @@ def sync_job_data(job_id):
         sync_data = request.get_json()
         job = active_jobs[job_id]
         
-        # Receive sync data and return our local result
+        # Extract source URL from request (if available via headers or construct from request)
+        # For now, we'll use node_id to identify the peer, but we can enhance this
+        source_url = sync_data.get('source_url')
+        if not source_url:
+            # Try to construct from request
+            source_url = request.headers.get('Origin') or request.headers.get('Referer')
+        
+        # Add source URL to sync data for attestation session management
+        if source_url:
+            sync_data['source_url'] = source_url
+        
+        # Receive sync data and return our local result (with attestation verification)
         result = job.receive_sync(sync_data)
         return jsonify(result)
         
     except Exception as e:
+        logger.error(f"Error in sync endpoint: {e}")
         return jsonify({'error': str(e)}), 500
 
 
