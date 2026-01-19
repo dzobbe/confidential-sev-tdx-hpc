@@ -318,59 +318,96 @@ class HPCJob:
                                 continue
                         
                         # Verify attestation quote from peer if present
+                        # Always verify fresh - never trust cached session state
                         attestation_verified = False
-                        if session and node_result.get('attestation_quote'):
+                        
+                        if node_result.get('attestation_quote'):
                             peer_quote_b64 = node_result.get('attestation_quote')
                             peer_tee_type = node_result.get('tee_type')
                             
-                            try:
-                                peer_quote = base64.b64decode(peer_quote_b64)
-                                # Use the nonce we sent for verification
-                                is_valid, verify_result = self.azure_verifier.verify_quote(
-                                    quote=peer_quote,
-                                    tee_type=peer_tee_type,
-                                    nonce=nonce
-                                )
+                            if not peer_tee_type:
+                                logger.warning(f"No tee_type provided with attestation quote from {node_url}")
+                                node_result['attestation_verified'] = False
+                                node_result['attestation_error'] = 'Missing tee_type'
                                 
-                                if is_valid:
-                                    # Update session with verified peer quote
-                                    session.peer_quote = peer_quote
-                                    session.peer_verified = True
-                                    attestation_verified = True
-                                    logger.debug(f"Verified attestation quote from {node_url}")
-                                else:
-                                    error_msg = verify_result.get('error', 'Attestation verification failed')
-                                    logger.warning(f"Attestation verification failed for {node_url}: {error_msg}")
+                                # Reset session verification status
+                                if session:
+                                    session.peer_verified = False
+                                    session.peer_quote = None
+                                
+                                if self.require_attestation:
+                                    logger.error(f"Attestation required but missing tee_type from {node_url}. Skipping sync with this node.")
+                                    continue
+                            else:
+                                try:
+                                    peer_quote = base64.b64decode(peer_quote_b64)
+                                    # Use the nonce we sent for verification - always verify fresh
+                                    is_valid, verify_result = self.azure_verifier.verify_quote(
+                                        quote=peer_quote,
+                                        tee_type=peer_tee_type,
+                                        nonce=nonce
+                                    )
+                                    
+                                    if is_valid:
+                                        attestation_verified = True
+                                        logger.debug(f"Verified attestation quote from {node_url}")
+                                        
+                                        # Update session with verified peer quote
+                                        if session:
+                                            session.peer_quote = peer_quote
+                                            session.peer_verified = True
+                                    else:
+                                        error_msg = verify_result.get('error', 'Attestation verification failed')
+                                        logger.warning(f"Attestation verification failed for {node_url}: {error_msg}")
+                                        node_result['attestation_verified'] = False
+                                        node_result['attestation_error'] = error_msg
+                                        
+                                        # Reset session verification status - trust is broken
+                                        if session:
+                                            session.peer_verified = False
+                                            session.peer_quote = None
+                                            logger.warning(f"Invalidated attestation session for {node_url} due to verification failure")
+                                        
+                                        # If attestation is required, fail the sync for this node
+                                        if self.require_attestation:
+                                            logger.error(f"Attestation required but verification failed for {node_url}. Skipping sync with this node.")
+                                            continue  # Skip this node and don't add it to results
+                                except Exception as e:
+                                    logger.warning(f"Error verifying attestation from {node_url}: {e}")
                                     node_result['attestation_verified'] = False
-                                    node_result['attestation_error'] = error_msg
+                                    node_result['attestation_error'] = str(e)
+                                    
+                                    # Reset session verification status - trust is broken
+                                    if session:
+                                        session.peer_verified = False
+                                        session.peer_quote = None
+                                        logger.warning(f"Invalidated attestation session for {node_url} due to verification error")
                                     
                                     # If attestation is required, fail the sync for this node
                                     if self.require_attestation:
-                                        logger.error(f"Attestation required but verification failed for {node_url}. Skipping sync with this node.")
+                                        logger.error(f"Attestation required but verification error occurred for {node_url}. Skipping sync with this node.")
                                         continue  # Skip this node and don't add it to results
-                            except Exception as e:
-                                logger.warning(f"Error verifying attestation from {node_url}: {e}")
-                                node_result['attestation_verified'] = False
-                                node_result['attestation_error'] = str(e)
-                                
-                                # If attestation is required, fail the sync for this node
-                                if self.require_attestation:
-                                    logger.error(f"Attestation required but verification error occurred for {node_url}. Skipping sync with this node.")
-                                    continue  # Skip this node and don't add it to results
                         else:
                             # No attestation quote provided
                             logger.debug(f"No attestation quote provided by {node_url}")
-                            node_result['attestation_verified'] = False
+                            attestation_verified = False
+                            
+                            # Reset session verification status if no quote provided when required
+                            if session and self.require_attestation:
+                                session.peer_verified = False
+                                session.peer_quote = None
+                                logger.warning(f"Invalidated attestation session for {node_url} - no quote provided")
                             
                             # If attestation is required, fail the sync for this node
                             if self.require_attestation:
                                 logger.error(f"Attestation required but no quote provided by {node_url}. Skipping sync with this node.")
                                 continue  # Skip this node and don't add it to results
                         
-                        # Only add to results if attestation passed (or not required)
+                        # Only add to results if we reach here (verification passed or not required)
+                        # Set attestation_verified flag in result
                         node_result['attestation_verified'] = attestation_verified
                         other_results.append(node_result)
-                        logger.debug(f"Synced with node at {node_url}: {node_result.get('node_id')}")
+                        logger.debug(f"Synced with node at {node_url}: {node_result.get('node_id')} (attestation_verified={attestation_verified})")
                     else:
                         logger.warning(f"Sync failed with {node_url}: Status {response.status_code}")
                 except requests.exceptions.RequestException as e:
@@ -468,6 +505,15 @@ class HPCJob:
                         attestation_error = verify_result.get('error', 'Attestation verification failed')
                         logger.warning(f"Attestation verification failed for node {source_node_id}: {attestation_error}")
                         
+                        # Reset session verification status - trust is broken
+                        session_identifier = source_node_url or source_node_id
+                        if session_identifier and MutualAttestationSession:
+                            session = self._get_or_create_attestation_session(session_identifier)
+                            if session:
+                                session.peer_verified = False
+                                session.peer_quote = None
+                                logger.warning(f"Invalidated attestation session for {source_node_id} due to verification failure")
+                        
                         # If attestation is required, reject the sync
                         if self.require_attestation:
                             logger.error(f"Attestation required but verification failed for node {source_node_id}. Rejecting sync request.")
@@ -480,6 +526,15 @@ class HPCJob:
                     attestation_error = str(e)
                     logger.warning(f"Error verifying attestation from node {source_node_id}: {e}")
                     
+                    # Reset session verification status - trust is broken
+                    session_identifier = source_node_url or source_node_id
+                    if session_identifier and MutualAttestationSession:
+                        session = self._get_or_create_attestation_session(session_identifier)
+                        if session:
+                            session.peer_verified = False
+                            session.peer_quote = None
+                            logger.warning(f"Invalidated attestation session for {source_node_id} due to verification error")
+                    
                     # If attestation is required, reject the sync
                     if self.require_attestation:
                         logger.error(f"Attestation required but verification error occurred for node {source_node_id}. Rejecting sync request.")
@@ -490,6 +545,16 @@ class HPCJob:
                         }
             else:
                 attestation_error = "Missing nonce or tee_type for attestation verification"
+                
+                # Reset session verification status
+                session_identifier = source_node_url or source_node_id
+                if session_identifier and MutualAttestationSession:
+                    session = self._get_or_create_attestation_session(session_identifier)
+                    if session:
+                        session.peer_verified = False
+                        session.peer_quote = None
+                        logger.warning(f"Invalidated attestation session for {source_node_id} - missing attestation data")
+                
                 # If attestation is required, reject the sync
                 if self.require_attestation:
                     logger.error(f"Attestation required but missing nonce or tee_type from node {source_node_id}. Rejecting sync request.")
@@ -500,6 +565,16 @@ class HPCJob:
                     }
         else:
             logger.debug(f"No attestation quote provided by node {source_node_id}")
+            
+            # Reset session verification status
+            session_identifier = source_node_url or source_node_id
+            if session_identifier and MutualAttestationSession and self.require_attestation:
+                session = self._get_or_create_attestation_session(session_identifier)
+                if session:
+                    session.peer_verified = False
+                    session.peer_quote = None
+                    logger.warning(f"Invalidated attestation session for {source_node_id} - no quote provided")
+            
             # If attestation is required, reject the sync
             if self.require_attestation:
                 logger.error(f"Attestation required but no quote provided by node {source_node_id}. Rejecting sync request.")
