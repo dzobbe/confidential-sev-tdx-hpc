@@ -113,7 +113,10 @@ def submit_job():
             "job_id": "<job_id>",
             "data": [...],
             "parameters": {...},
-            "max_iterations": 100
+            "max_iterations": 100,
+            "node_id": "<node_id>",  # Optional, defaults to TEE_TYPE
+            "total_nodes": 1,  # Total number of nodes
+            "other_node_urls": ["http://...", ...]  # URLs of other nodes for sync
         }
     
     Response:
@@ -129,11 +132,14 @@ def submit_job():
         job_data = data.get('data', [])
         parameters = data.get('parameters', {})
         max_iterations = data.get('max_iterations', 100)
+        node_id = data.get('node_id', TEE_TYPE)
+        total_nodes = data.get('total_nodes', 1)
+        other_node_urls = data.get('other_node_urls', [])
         
         if not job_id:
             job_id = str(uuid.uuid4())
         
-        # Create HPC job with attestation components
+        # Create HPC job with attestation components and multi-node support
         job = HPCJob(
             job_id=job_id,
             data=job_data,
@@ -141,7 +147,11 @@ def submit_job():
             max_iterations=max_iterations,
             tee_type=TEE_TYPE,
             azure_verifier=azure_verifier,
-            quote_generator=AttestationQuoteGenerator
+            quote_generator=AttestationQuoteGenerator,
+            node_id=node_id,
+            total_nodes=total_nodes,
+            other_node_urls=other_node_urls,
+            sync_enabled=total_nodes > 1
         )
         
         # Store job
@@ -154,7 +164,9 @@ def submit_job():
         return jsonify({
             'job_id': job_id,
             'status': 'accepted',
-            'message': 'Job submitted successfully'
+            'message': 'Job submitted successfully',
+            'node_id': node_id,
+            'total_nodes': total_nodes
         })
         
     except Exception as e:
@@ -181,8 +193,44 @@ def get_job_results(job_id):
     return jsonify({
         'job_id': job_id,
         'results': job.get_results(),
-        'status': job.status.value
+        'status': job.status.value,
+        'node_id': job.node_id
     })
+
+
+@app.route('/job/<job_id>/sync', methods=['POST'])
+def sync_job_data(job_id):
+    """
+    Synchronize job data with another node
+    
+    Request body:
+        {
+            "job_id": "<job_id>",
+            "iteration": <iteration_number>,
+            "node_id": "<source_node_id>",
+            "local_result": {...}
+        }
+    
+    Response:
+        {
+            "node_id": "<this_node_id>",
+            "local_result": {...},
+            "timestamp": "<timestamp>"
+        }
+    """
+    if job_id not in active_jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    try:
+        sync_data = request.get_json()
+        job = active_jobs[job_id]
+        
+        # Receive sync data and return our local result
+        result = job.receive_sync(sync_data)
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':

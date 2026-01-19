@@ -169,18 +169,29 @@ class TEEHPCClient:
         # Step 3: Submit jobs to enabled servers
         print("\n[Step 3] Submitting jobs to TEE VMs...")
         
+        # Build mapping of node types to URLs for sync
+        node_urls = {}
+        for node_type in self.enabled_nodes:
+            node_urls[node_type] = self.sev_server_url if node_type == 'SEV' else self.tdx_server_url
+        
         job_results = {}
         
-        # Submit to each enabled node
+        # Submit to each enabled node with multi-node configuration
         for node_type in self.enabled_nodes:
-            server_url = self.sev_server_url if node_type == 'SEV' else self.tdx_server_url
+            server_url = node_urls[node_type]
+            
+            # Build list of other node URLs for synchronization
+            other_node_urls = [url for ntype, url in node_urls.items() if ntype != node_type]
             
             job_result = self._submit_to_server(
                 server_url,
                 job_id,
                 node_data[node_type],
                 parameters,
-                max_iterations
+                max_iterations,
+                node_id=node_type,
+                total_nodes=len(self.enabled_nodes),
+                other_node_urls=other_node_urls
             )
             
             job_results[node_type] = job_result
@@ -193,7 +204,8 @@ class TEEHPCClient:
                     'job_id': job_id
                 }
             
-            print(f"✓ {node_type} job submitted successfully")
+            sync_info = f" (sync with {len(other_node_urls)} other node(s))" if other_node_urls else ""
+            print(f"✓ {node_type} job submitted successfully{sync_info}")
         
         return {
             'success': True,
@@ -204,29 +216,43 @@ class TEEHPCClient:
         }
     
     def _submit_to_server(self, server_url: str, job_id: str, data: List[Dict],
-                          parameters: Dict, max_iterations: int) -> Dict:
+                          parameters: Dict, max_iterations: int,
+                          node_id: Optional[str] = None,
+                          total_nodes: int = 1,
+                          other_node_urls: Optional[List[str]] = None) -> Dict:
         """
         Submit job to a specific server
         
         Args:
             server_url: Server URL
             job_id: Job identifier
-            data: Job data
+            data: Job data (partitioned for this node)
             parameters: Job parameters
             max_iterations: Maximum iterations
+            node_id: Identifier for this node
+            total_nodes: Total number of nodes
+            other_node_urls: URLs of other nodes for synchronization
             
         Returns:
             Submission result
         """
         try:
+            payload = {
+                'job_id': job_id,
+                'data': data,
+                'parameters': parameters,
+                'max_iterations': max_iterations
+            }
+            
+            # Add multi-node configuration if applicable
+            if total_nodes > 1:
+                payload['node_id'] = node_id
+                payload['total_nodes'] = total_nodes
+                payload['other_node_urls'] = other_node_urls or []
+            
             response = requests.post(
                 f"{server_url}/job/submit",
-                json={
-                    'job_id': job_id,
-                    'data': data,
-                    'parameters': parameters,
-                    'max_iterations': max_iterations
-                },
+                json=payload,
                 timeout=30
             )
             
