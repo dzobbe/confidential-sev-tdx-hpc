@@ -395,16 +395,50 @@ class AttestationQuoteGenerator:
         return base64.b64encode(data).decode("ascii")
     
     @staticmethod
+    def _print_mrtd(mrtd: Optional[bytes], source: str = "quote"):
+        """
+        Print MRTD in base64 format
+        
+        Args:
+            mrtd: MRTD bytes or None
+            source: Source description for logging
+        """
+        if mrtd:
+            try:
+                # Handle different types
+                if isinstance(mrtd, str):
+                    # If it's already a string, try to decode if it's base64
+                    try:
+                        mrtd_bytes = base64.b64decode(mrtd)
+                        mrtd_b64 = mrtd
+                    except:
+                        mrtd_b64 = base64.b64encode(mrtd.encode('utf-8')).decode('utf-8')
+                elif isinstance(mrtd, bytes):
+                    mrtd_b64 = base64.b64encode(mrtd).decode('utf-8')
+                else:
+                    # Try to convert to bytes
+                    mrtd_bytes = bytes(mrtd)
+                    mrtd_b64 = base64.b64encode(mrtd_bytes).decode('utf-8')
+                
+                print(f"MRTD (base64): {mrtd_b64}")
+                logger.info(f"MRTD extracted from {source}: {mrtd_b64}")
+            except Exception as e:
+                logger.error(f"Error formatting MRTD for printing: {e}")
+        else:
+            logger.warning(f"Could not extract MRTD from {source}")
+    
+    @staticmethod
     def _extract_mrtd_from_tdx_quote(quote_bytes: bytes) -> Optional[bytes]:
         """
         Extract MRTD (Measurement Register Table Digest) from TDX quote
         
-        TDX quote structure:
-        - Quote header (variable size, typically 48 bytes)
+        TDX quote structure can vary, but typically contains:
+        - Quote header/metadata (variable size)
         - TD report (144 bytes) - contains MRTD at offset 0x80 (128 bytes)
-        - Signature data (variable size)
+        - Certificates and signature data (variable size)
         
         MRTD is a 48-byte SHA384 digest located at offset 0x80 within the TD report.
+        This function searches through the quote to find the TD report section.
         
         Args:
             quote_bytes: Raw TDX quote bytes
@@ -413,21 +447,22 @@ class AttestationQuoteGenerator:
             MRTD bytes (48 bytes) or None if extraction fails
         """
         try:
-            # TD report is 144 bytes and typically starts after the quote header
-            # The quote header is typically 48 bytes for TDX quotes
-            # MRTD is at offset 0x80 (128 bytes) from the start of the TD report
+            mrtd_size = 48
+            td_report_size = 144
+            mrtd_offset_in_report = 128  # Offset within TD report
             
             # Try different possible offsets for TD report start
-            # Common TDX quote header sizes: 48, 64, or 80 bytes
-            possible_header_sizes = [48, 64, 80]
+            # TDX quotes can have variable header sizes depending on format
+            # Try a wider range of header sizes
+            possible_header_sizes = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 256, 512]
             
             for header_size in possible_header_sizes:
-                if len(quote_bytes) < header_size + 144:
+                if len(quote_bytes) < header_size + td_report_size:
                     continue
                 
                 # TD report starts after header
                 td_report_start = header_size
-                td_report_end = td_report_start + 144
+                td_report_end = td_report_start + td_report_size
                 
                 if len(quote_bytes) < td_report_end:
                     continue
@@ -436,19 +471,33 @@ class AttestationQuoteGenerator:
                 td_report = quote_bytes[td_report_start:td_report_end]
                 
                 # MRTD is at offset 0x80 (128 bytes) within TD report, 48 bytes long
-                mrtd_offset = 128
-                mrtd_size = 48
-                
-                if len(td_report) >= mrtd_offset + mrtd_size:
-                    mrtd = td_report[mrtd_offset:mrtd_offset + mrtd_size]
-                    logger.debug(f"Extracted MRTD using header size {header_size} bytes")
-                    return mrtd
+                if len(td_report) >= mrtd_offset_in_report + mrtd_size:
+                    mrtd = td_report[mrtd_offset_in_report:mrtd_offset_in_report + mrtd_size]
+                    # Validate: MRTD should not be all zeros (unlikely but possible)
+                    if mrtd != b'\x00' * mrtd_size:
+                        logger.debug(f"Extracted MRTD using header size {header_size} bytes")
+                        return mrtd
             
-            # If standard offsets don't work, try to find TD report by looking for known patterns
-            # TD report typically starts with version field (4 bytes) and other known fields
-            # For now, log a warning and return None
+            # If standard offsets don't work, try sliding window approach
+            # Search for TD report pattern by looking for MRTD-like patterns
+            # TD report has specific structure, but we can search for non-zero 48-byte chunks
+            # at positions that could be MRTD (offset 128 within a 144-byte window)
+            logger.debug("Trying sliding window approach to find TD report")
+            for start_offset in range(0, min(len(quote_bytes) - td_report_size, 2000), 16):
+                td_report = quote_bytes[start_offset:start_offset + td_report_size]
+                if len(td_report) >= mrtd_offset_in_report + mrtd_size:
+                    mrtd = td_report[mrtd_offset_in_report:mrtd_offset_in_report + mrtd_size]
+                    # Check if this looks like a valid MRTD (not all zeros, not all 0xFF)
+                    if mrtd != b'\x00' * mrtd_size and mrtd != b'\xff' * mrtd_size:
+                        # Additional validation: check if surrounding bytes look reasonable
+                        # TD report should have some structure, not random data
+                        logger.debug(f"Found potential MRTD at offset {start_offset + mrtd_offset_in_report}")
+                        return mrtd
+            
+            # If still not found, log detailed info for debugging
             logger.warning(f"Could not extract MRTD from quote (length: {len(quote_bytes)} bytes)")
-            logger.debug(f"Quote first 100 bytes (hex): {quote_bytes[:100].hex()}")
+            logger.debug(f"Quote first 200 bytes (hex): {quote_bytes[:200].hex()}")
+            logger.debug(f"Quote last 200 bytes (hex): {quote_bytes[-200:].hex()}")
             return None
             
         except Exception as e:
@@ -608,6 +657,21 @@ class AttestationQuoteGenerator:
             logger.debug(f"Evidence collected, type: {type(evidence)}")
             logger.debug(f"Evidence object attributes: {[attr for attr in dir(evidence) if not attr.startswith('_')]}")
             
+            # First, check if evidence object has MRTD directly
+            mrtd_from_evidence = None
+            if hasattr(evidence, 'mrtd'):
+                mrtd_from_evidence = evidence.mrtd
+                logger.debug("Found MRTD directly in evidence object")
+            elif hasattr(evidence, 'tdx_mrtd'):
+                mrtd_from_evidence = evidence.tdx_mrtd
+                logger.debug("Found tdx_mrtd in evidence object")
+            elif hasattr(evidence, 'td_report'):
+                # Check if td_report has MRTD
+                td_report = evidence.td_report
+                if hasattr(td_report, 'mrtd'):
+                    mrtd_from_evidence = td_report.mrtd
+                    logger.debug("Found MRTD in td_report")
+            
             # Extract quote from evidence object
             # The quote field may be base64-encoded or raw bytes
             if hasattr(evidence, 'quote'):
@@ -623,13 +687,8 @@ class AttestationQuoteGenerator:
                         quote_bytes = base64.b64decode(quote_value)
                         logger.info(f"Successfully decoded base64 quote, length: {len(quote_bytes)} bytes")
                         # Extract and print MRTD
-                        mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                        if mrtd:
-                            mrtd_b64 = base64.b64encode(mrtd).decode('utf-8')
-                            print(f"MRTD (base64): {mrtd_b64}")
-                            logger.info(f"MRTD extracted: {mrtd_b64}")
-                        else:
-                            logger.warning("Could not extract MRTD from quote")
+                        mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                        AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
                         return quote_bytes
                     except Exception as e:
                         logger.warning(f"Base64 decode failed: {e}, trying base64url")
@@ -644,12 +703,8 @@ class AttestationQuoteGenerator:
                             quote_bytes = base64.b64decode(quote_b64)
                             logger.info(f"Successfully decoded base64url quote, length: {len(quote_bytes)} bytes")
                             # Extract and print MRTD
-                            mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                            if mrtd:
-                                print(f"MRTD (hex): {mrtd.hex()}")
-                                logger.info(f"MRTD extracted: {mrtd.hex()}")
-                            else:
-                                logger.warning("Could not extract MRTD from quote")
+                            mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                            AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
                             return quote_bytes
                         except Exception as e2:
                             logger.error(f"Failed to decode quote as base64 or base64url: {e2}")
@@ -659,24 +714,16 @@ class AttestationQuoteGenerator:
                     # Already bytes, return directly
                     logger.info(f"Quote is already bytes, length: {len(quote_value)} bytes")
                     # Extract and print MRTD
-                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_value)
-                    if mrtd:
-                        print(f"MRTD (hex): {mrtd.hex()}")
-                        logger.info(f"MRTD extracted: {mrtd.hex()}")
-                    else:
-                        logger.warning("Could not extract MRTD from quote")
+                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_value)
+                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
                     return quote_value
                 else:
                     # Try to convert to bytes
                     logger.warning(f"Quote is unexpected type {type(quote_value)}, attempting conversion")
                     quote_bytes = bytes(quote_value)
                     # Extract and print MRTD
-                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                    if mrtd:
-                        print(f"MRTD (hex): {mrtd.hex()}")
-                        logger.info(f"MRTD extracted: {mrtd.hex()}")
-                    else:
-                        logger.warning("Could not extract MRTD from quote")
+                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
                     return quote_bytes
             else:
                 logger.warning("Evidence object does not have 'quote' attribute, searching alternatives")
@@ -688,12 +735,8 @@ class AttestationQuoteGenerator:
                         if isinstance(field_value, bytes):
                             logger.info(f"Using {field_name} as bytes, length: {len(field_value)} bytes")
                             # Extract and print MRTD
-                            mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(field_value)
-                            if mrtd:
-                                print(f"MRTD (hex): {mrtd.hex()}")
-                                logger.info(f"MRTD extracted: {mrtd.hex()}")
-                            else:
-                                logger.warning("Could not extract MRTD from quote")
+                            mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(field_value)
+                            AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
                             return field_value
                         elif isinstance(field_value, str):
                             logger.info(f"Using {field_name} as string, attempting to decode")
@@ -703,12 +746,8 @@ class AttestationQuoteGenerator:
                                 quote_bytes = base64.b64decode(field_value)
                                 logger.info(f"Successfully decoded {field_name} as base64, length: {len(quote_bytes)} bytes")
                                 # Extract and print MRTD
-                                mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                                if mrtd:
-                                    print(f"MRTD (hex): {mrtd.hex()}")
-                                    logger.info(f"MRTD extracted: {mrtd.hex()}")
-                                else:
-                                    logger.warning("Could not extract MRTD from quote")
+                                mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                                AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
                                 return quote_bytes
                             except Exception as e:
                                 logger.debug(f"Base64 decode failed for {field_name}: {e}, trying base64url")
@@ -723,12 +762,8 @@ class AttestationQuoteGenerator:
                                     quote_bytes = base64.b64decode(quote_b64)
                                     logger.info(f"Successfully decoded {field_name} as base64url, length: {len(quote_bytes)} bytes")
                                     # Extract and print MRTD
-                                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                                    if mrtd:
-                                        print(f"MRTD (hex): {mrtd.hex()}")
-                                        logger.info(f"MRTD extracted: {mrtd.hex()}")
-                                    else:
-                                        logger.warning("Could not extract MRTD from quote")
+                                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
                                     return quote_bytes
                                 except Exception as e2:
                                     logger.warning(f"Failed to decode {field_name} as base64 or base64url: {e2}")
@@ -737,6 +772,9 @@ class AttestationQuoteGenerator:
                                     continue
                 
                 # If no quote found, raise error
+                # But first, print MRTD if we found it in evidence
+                if mrtd_from_evidence:
+                    AttestationQuoteGenerator._print_mrtd(mrtd_from_evidence, "evidence")
                 logger.error("Evidence object does not contain a quote field")
                 logger.error(f"Available attributes: {dir(evidence)}")
                 raise ValueError("Evidence object does not contain a quote field")
