@@ -28,6 +28,7 @@ import shutil
 import urllib.parse
 import urllib.request
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import requests
@@ -588,20 +589,31 @@ class AttestationQuoteGenerator:
         
         # Write hash to TPM NV index 0x01400002
         # Write exactly 64 bytes into NV 0x01400002
+        # Use a temporary file since tpm2_nvwrite requires seekable input
         try:
-            proc = subprocess.run(
-                [
-                    "tpm2_nvwrite",
-                    "-C", "o",
-                    NV_REPORT_DATA,
-                    "-i", "/dev/stdin"
-                ],
-                input=digest,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
-            logger.info(f"Successfully wrote file hash to TPM NV index {NV_REPORT_DATA}")
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                tmp_file.write(digest)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                proc = subprocess.run(
+                    [
+                        "tpm2_nvwrite",
+                        "-C", "o",
+                        NV_REPORT_DATA,
+                        "-i", tmp_file_path
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                logger.info(f"Successfully wrote file hash to TPM NV index {NV_REPORT_DATA}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_file_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
         except subprocess.CalledProcessError as e:
             stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
             raise RuntimeError(
