@@ -245,6 +245,11 @@ def sync_job_data(job_id):
         
         # Receive sync data and return our local result (with attestation verification)
         result = job.receive_sync(sync_data)
+        
+        # If attestation failed and is required, return error status
+        if result.get('error') and 'attestation' in result.get('error', '').lower():
+            return jsonify(result), 403  # Forbidden - attestation verification failed
+        
         return jsonify(result)
         
     except Exception as e:

@@ -60,7 +60,8 @@ class HPCJob:
                  node_id: Optional[str] = None,
                  total_nodes: int = 1,
                  other_node_urls: Optional[List[str]] = None,
-                 sync_enabled: bool = True):
+                 sync_enabled: bool = True,
+                 require_attestation: bool = True):
         """
         Initialize HPC job
         
@@ -76,6 +77,7 @@ class HPCJob:
             total_nodes: Total number of nodes participating in this job
             other_node_urls: List of URLs for other nodes to sync with
             sync_enabled: Whether to enable synchronization between nodes
+            require_attestation: Whether to require successful attestation verification for sync (default: True)
         """
         self.job_id = job_id
         self.data = data
@@ -90,6 +92,7 @@ class HPCJob:
         self.total_nodes = total_nodes
         self.other_node_urls = other_node_urls or []
         self.sync_enabled = sync_enabled and total_nodes > 1
+        self.require_attestation = require_attestation
         
         self.status = JobStatus.PENDING
         self.current_iteration = 0
@@ -294,10 +297,28 @@ class HPCJob:
                         timeout=10.0  # Increased timeout for attestation verification
                     )
                     
+                    # Handle error responses (e.g., attestation verification failed)
+                    if response.status_code == 403:
+                        error_data = response.json()
+                        error_msg = error_data.get('error', 'Attestation verification failed')
+                        logger.error(f"Sync rejected by {node_url} due to attestation failure: {error_msg}")
+                        if self.require_attestation:
+                            # Skip this node if attestation is required
+                            continue
+                    
                     if response.status_code == 200:
                         node_result = response.json()
                         
+                        # Check if response contains an error (even with 200 status)
+                        if node_result.get('error'):
+                            error_msg = node_result.get('error', 'Unknown error')
+                            logger.error(f"Sync error from {node_url}: {error_msg}")
+                            if self.require_attestation and 'attestation' in error_msg.lower():
+                                # Skip this node if attestation is required
+                                continue
+                        
                         # Verify attestation quote from peer if present
+                        attestation_verified = False
                         if session and node_result.get('attestation_quote'):
                             peer_quote_b64 = node_result.get('attestation_quote')
                             peer_tee_type = node_result.get('tee_type')
@@ -315,22 +336,39 @@ class HPCJob:
                                     # Update session with verified peer quote
                                     session.peer_quote = peer_quote
                                     session.peer_verified = True
+                                    attestation_verified = True
                                     logger.debug(f"Verified attestation quote from {node_url}")
                                 else:
                                     error_msg = verify_result.get('error', 'Attestation verification failed')
                                     logger.warning(f"Attestation verification failed for {node_url}: {error_msg}")
-                                    # Continue but mark as unverified
                                     node_result['attestation_verified'] = False
                                     node_result['attestation_error'] = error_msg
+                                    
+                                    # If attestation is required, fail the sync for this node
+                                    if self.require_attestation:
+                                        logger.error(f"Attestation required but verification failed for {node_url}. Skipping sync with this node.")
+                                        continue  # Skip this node and don't add it to results
                             except Exception as e:
                                 logger.warning(f"Error verifying attestation from {node_url}: {e}")
                                 node_result['attestation_verified'] = False
                                 node_result['attestation_error'] = str(e)
+                                
+                                # If attestation is required, fail the sync for this node
+                                if self.require_attestation:
+                                    logger.error(f"Attestation required but verification error occurred for {node_url}. Skipping sync with this node.")
+                                    continue  # Skip this node and don't add it to results
                         else:
                             # No attestation quote provided
                             logger.debug(f"No attestation quote provided by {node_url}")
                             node_result['attestation_verified'] = False
+                            
+                            # If attestation is required, fail the sync for this node
+                            if self.require_attestation:
+                                logger.error(f"Attestation required but no quote provided by {node_url}. Skipping sync with this node.")
+                                continue  # Skip this node and don't add it to results
                         
+                        # Only add to results if attestation passed (or not required)
+                        node_result['attestation_verified'] = attestation_verified
                         other_results.append(node_result)
                         logger.debug(f"Synced with node at {node_url}: {node_result.get('node_id')}")
                     else:
@@ -428,14 +466,48 @@ class HPCJob:
                                 session.peer_verified = True
                     else:
                         attestation_error = verify_result.get('error', 'Attestation verification failed')
-                        logger.warning(f"Attestation verification failed for node {source_node_id}")
+                        logger.warning(f"Attestation verification failed for node {source_node_id}: {attestation_error}")
+                        
+                        # If attestation is required, reject the sync
+                        if self.require_attestation:
+                            logger.error(f"Attestation required but verification failed for node {source_node_id}. Rejecting sync request.")
+                            return {
+                                'error': 'Attestation verification failed',
+                                'attestation_error': attestation_error,
+                                'node_id': self.node_id
+                            }
                 except Exception as e:
                     attestation_error = str(e)
                     logger.warning(f"Error verifying attestation from node {source_node_id}: {e}")
+                    
+                    # If attestation is required, reject the sync
+                    if self.require_attestation:
+                        logger.error(f"Attestation required but verification error occurred for node {source_node_id}. Rejecting sync request.")
+                        return {
+                            'error': 'Attestation verification error',
+                            'attestation_error': attestation_error,
+                            'node_id': self.node_id
+                        }
             else:
                 attestation_error = "Missing nonce or tee_type for attestation verification"
+                # If attestation is required, reject the sync
+                if self.require_attestation:
+                    logger.error(f"Attestation required but missing nonce or tee_type from node {source_node_id}. Rejecting sync request.")
+                    return {
+                        'error': 'Missing attestation data',
+                        'attestation_error': attestation_error,
+                        'node_id': self.node_id
+                    }
         else:
             logger.debug(f"No attestation quote provided by node {source_node_id}")
+            # If attestation is required, reject the sync
+            if self.require_attestation:
+                logger.error(f"Attestation required but no quote provided by node {source_node_id}. Rejecting sync request.")
+                return {
+                    'error': 'No attestation quote provided',
+                    'attestation_error': 'Attestation quote is required but was not provided',
+                    'node_id': self.node_id
+                }
         
         # Return our local result for this iteration
         with self.lock:
