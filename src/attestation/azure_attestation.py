@@ -811,7 +811,10 @@ class AttestationQuoteGenerator:
                 tee_server_path = current_file.parent.parent / "server" / "tee_server.py"
                 logger.debug(f"Hashing tee_server.py and writing to NV index: {tee_server_path}")
                 file_hash = AttestationQuoteGenerator._hash_file_and_write_to_nv(str(tee_server_path))
+                file_hash_b64 = AttestationQuoteGenerator._b64_std(file_hash)
+                print(f"TEE_SERVER_HASH_BASE64: {file_hash_b64}")
                 logger.info(f"tee_server.py hash written to NV index {NV_REPORT_DATA}: {file_hash.hex()}")
+                logger.info(f"tee_server.py hash (base64): {file_hash_b64}")
             except Exception as e:
                 logger.warning(f"Failed to hash and write tee_server.py to NV index: {e}")
                 logger.debug("Continuing with quote generation despite file hash write failure")
