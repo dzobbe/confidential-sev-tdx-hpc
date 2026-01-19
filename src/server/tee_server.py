@@ -396,6 +396,11 @@ def sync():
             try:
                 decrypted = session.decrypt_message(base64.b64decode(data['encrypted']))
                 data = json.loads(decrypted.decode())
+                # Validate that decrypted job_id matches outer request job_id
+                decrypted_job_id = data.get('job_id')
+                if decrypted_job_id and decrypted_job_id != job_id:
+                    logger.error(f"sync: Job ID mismatch - outer: {job_id}, decrypted: {decrypted_job_id}")
+                    return jsonify({'error': 'Job ID mismatch in encrypted data'}), 400
             except Exception as e:
                 logger.error(f"sync: Failed to decrypt data for job {job_id}: {e}")
                 return jsonify({'error': 'Failed to decrypt sync data'}), 400

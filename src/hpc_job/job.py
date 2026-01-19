@@ -290,12 +290,20 @@ class HPCJob:
             logger.debug(f"Job {self.job_id}: Preparing sync data for iteration {iteration}")
             
             # Encrypt sync data if mutual attestation is established
+            # Keep job_id in outer request so receiver can look up the session
+            job_id = sync_data.pop('job_id')  # Extract job_id before encryption
             if self.mutual_attestation_session.is_session_ready():
                 logger.debug(f"Job {self.job_id}: Encrypting sync data")
                 sync_data_encrypted = self.mutual_attestation_session.encrypt_message(
                     json.dumps(sync_data).encode()
                 )
-                sync_data = {'encrypted': base64.b64encode(sync_data_encrypted).decode()}
+                sync_data = {
+                    'job_id': job_id,  # Include job_id in outer request
+                    'encrypted': base64.b64encode(sync_data_encrypted).decode()
+                }
+            else:
+                # If not encrypting, put job_id back
+                sync_data['job_id'] = job_id
             
             # Send sync request to peer
             logger.info(f"Job {self.job_id}: Sending sync request to {self.peer_url}/sync")
