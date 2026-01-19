@@ -171,6 +171,7 @@ class AzureAttestationVerifier:
                 timeout=30
             )
             
+            print(response.text)
             logger.debug(f"Azure Attestation Service response status: {response.status_code}")
             
             if response.status_code != 200:

@@ -1,0 +1,21 @@
+version=1.2;
+
+configurationrules
+{
+};
+
+
+authorizationrules
+{
+    [type=="tdx_mrtd",
+     value=="5e12f31dd62d1db804906a46f54255070585174a2e9a0752d2e1c1ec180db120aa703450936a595d01dea575adbf5726"]
+   &&
+    [type=="tdx_report_data",     value=="36b271fe9ec738bf0c635faf171bf0ced47fb3a85dd9367f38127561f58754880000000000000000000000000000000000000000000000000000000000000000"]
+        => permit();
+};
+
+issuancerules
+{
+    c:[type=="tdx_mrtd"] => issue(type="dbg_tdx_mrtd", value=c.value);
+    c:[type=="tdx_report_data"] => issue(type="dbg_tdx_report_data", value=c.value);
+};
