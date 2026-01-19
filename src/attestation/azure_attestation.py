@@ -589,7 +589,7 @@ class AttestationQuoteGenerator:
         # Write hash to TPM NV index 0x01400002
         # Write exactly 64 bytes into NV 0x01400002
         try:
-            subprocess.check_call(
+            proc = subprocess.run(
                 [
                     "tpm2_nvwrite",
                     "-C", "o",
@@ -597,7 +597,9 @@ class AttestationQuoteGenerator:
                     "-i", "/dev/stdin"
                 ],
                 input=digest,
-                stderr=subprocess.PIPE
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
             )
             logger.info(f"Successfully wrote file hash to TPM NV index {NV_REPORT_DATA}")
         except subprocess.CalledProcessError as e:
