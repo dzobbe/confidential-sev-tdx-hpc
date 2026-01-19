@@ -395,6 +395,68 @@ class AttestationQuoteGenerator:
         return base64.b64encode(data).decode("ascii")
     
     @staticmethod
+    def _extract_mrtd_from_tdx_quote(quote_bytes: bytes) -> Optional[bytes]:
+        """
+        Extract MRTD (Measurement Register Table Digest) from TDX quote
+        
+        TDX quote structure:
+        - Quote header (variable size, typically 48 bytes)
+        - TD report (144 bytes) - contains MRTD at offset 0x80 (128 bytes)
+        - Signature data (variable size)
+        
+        MRTD is a 48-byte SHA384 digest located at offset 0x80 within the TD report.
+        
+        Args:
+            quote_bytes: Raw TDX quote bytes
+            
+        Returns:
+            MRTD bytes (48 bytes) or None if extraction fails
+        """
+        try:
+            # TD report is 144 bytes and typically starts after the quote header
+            # The quote header is typically 48 bytes for TDX quotes
+            # MRTD is at offset 0x80 (128 bytes) from the start of the TD report
+            
+            # Try different possible offsets for TD report start
+            # Common TDX quote header sizes: 48, 64, or 80 bytes
+            possible_header_sizes = [48, 64, 80]
+            
+            for header_size in possible_header_sizes:
+                if len(quote_bytes) < header_size + 144:
+                    continue
+                
+                # TD report starts after header
+                td_report_start = header_size
+                td_report_end = td_report_start + 144
+                
+                if len(quote_bytes) < td_report_end:
+                    continue
+                
+                # Extract TD report
+                td_report = quote_bytes[td_report_start:td_report_end]
+                
+                # MRTD is at offset 0x80 (128 bytes) within TD report, 48 bytes long
+                mrtd_offset = 128
+                mrtd_size = 48
+                
+                if len(td_report) >= mrtd_offset + mrtd_size:
+                    mrtd = td_report[mrtd_offset:mrtd_offset + mrtd_size]
+                    logger.debug(f"Extracted MRTD using header size {header_size} bytes")
+                    return mrtd
+            
+            # If standard offsets don't work, try to find TD report by looking for known patterns
+            # TD report typically starts with version field (4 bytes) and other known fields
+            # For now, log a warning and return None
+            logger.warning(f"Could not extract MRTD from quote (length: {len(quote_bytes)} bytes)")
+            logger.debug(f"Quote first 100 bytes (hex): {quote_bytes[:100].hex()}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting MRTD: {e}")
+            logger.exception("Exception details:")
+            return None
+    
+    @staticmethod
     def _fetch_vcek_cert_chain_pem() -> bytes:
         """
         Fetch VCEK cert and chain from Azure THIM endpoint (metadata service).
@@ -560,6 +622,14 @@ class AttestationQuoteGenerator:
                         # Try to decode base64
                         quote_bytes = base64.b64decode(quote_value)
                         logger.info(f"Successfully decoded base64 quote, length: {len(quote_bytes)} bytes")
+                        # Extract and print MRTD
+                        mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                        if mrtd:
+                            mrtd_b64 = base64.b64encode(mrtd).decode('utf-8')
+                            print(f"MRTD (base64): {mrtd_b64}")
+                            logger.info(f"MRTD extracted: {mrtd_b64}")
+                        else:
+                            logger.warning("Could not extract MRTD from quote")
                         return quote_bytes
                     except Exception as e:
                         logger.warning(f"Base64 decode failed: {e}, trying base64url")
@@ -573,6 +643,13 @@ class AttestationQuoteGenerator:
                                 quote_b64 += '=' * (4 - padding)
                             quote_bytes = base64.b64decode(quote_b64)
                             logger.info(f"Successfully decoded base64url quote, length: {len(quote_bytes)} bytes")
+                            # Extract and print MRTD
+                            mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                            if mrtd:
+                                print(f"MRTD (hex): {mrtd.hex()}")
+                                logger.info(f"MRTD extracted: {mrtd.hex()}")
+                            else:
+                                logger.warning("Could not extract MRTD from quote")
                             return quote_bytes
                         except Exception as e2:
                             logger.error(f"Failed to decode quote as base64 or base64url: {e2}")
@@ -581,11 +658,26 @@ class AttestationQuoteGenerator:
                 elif isinstance(quote_value, bytes):
                     # Already bytes, return directly
                     logger.info(f"Quote is already bytes, length: {len(quote_value)} bytes")
+                    # Extract and print MRTD
+                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_value)
+                    if mrtd:
+                        print(f"MRTD (hex): {mrtd.hex()}")
+                        logger.info(f"MRTD extracted: {mrtd.hex()}")
+                    else:
+                        logger.warning("Could not extract MRTD from quote")
                     return quote_value
                 else:
                     # Try to convert to bytes
                     logger.warning(f"Quote is unexpected type {type(quote_value)}, attempting conversion")
-                    return bytes(quote_value)
+                    quote_bytes = bytes(quote_value)
+                    # Extract and print MRTD
+                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                    if mrtd:
+                        print(f"MRTD (hex): {mrtd.hex()}")
+                        logger.info(f"MRTD extracted: {mrtd.hex()}")
+                    else:
+                        logger.warning("Could not extract MRTD from quote")
+                    return quote_bytes
             else:
                 logger.warning("Evidence object does not have 'quote' attribute, searching alternatives")
                 # If quote field not found, try common alternative field names
@@ -595,6 +687,13 @@ class AttestationQuoteGenerator:
                         field_value = getattr(evidence, field_name)
                         if isinstance(field_value, bytes):
                             logger.info(f"Using {field_name} as bytes, length: {len(field_value)} bytes")
+                            # Extract and print MRTD
+                            mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(field_value)
+                            if mrtd:
+                                print(f"MRTD (hex): {mrtd.hex()}")
+                                logger.info(f"MRTD extracted: {mrtd.hex()}")
+                            else:
+                                logger.warning("Could not extract MRTD from quote")
                             return field_value
                         elif isinstance(field_value, str):
                             logger.info(f"Using {field_name} as string, attempting to decode")
@@ -603,6 +702,13 @@ class AttestationQuoteGenerator:
                             try:
                                 quote_bytes = base64.b64decode(field_value)
                                 logger.info(f"Successfully decoded {field_name} as base64, length: {len(quote_bytes)} bytes")
+                                # Extract and print MRTD
+                                mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                                if mrtd:
+                                    print(f"MRTD (hex): {mrtd.hex()}")
+                                    logger.info(f"MRTD extracted: {mrtd.hex()}")
+                                else:
+                                    logger.warning("Could not extract MRTD from quote")
                                 return quote_bytes
                             except Exception as e:
                                 logger.debug(f"Base64 decode failed for {field_name}: {e}, trying base64url")
@@ -616,6 +722,13 @@ class AttestationQuoteGenerator:
                                         quote_b64 += '=' * (4 - padding)
                                     quote_bytes = base64.b64decode(quote_b64)
                                     logger.info(f"Successfully decoded {field_name} as base64url, length: {len(quote_bytes)} bytes")
+                                    # Extract and print MRTD
+                                    mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
+                                    if mrtd:
+                                        print(f"MRTD (hex): {mrtd.hex()}")
+                                        logger.info(f"MRTD extracted: {mrtd.hex()}")
+                                    else:
+                                        logger.warning("Could not extract MRTD from quote")
                                     return quote_bytes
                                 except Exception as e2:
                                     logger.warning(f"Failed to decode {field_name} as base64 or base64url: {e2}")
