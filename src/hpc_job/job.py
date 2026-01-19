@@ -428,7 +428,7 @@ class HPCJob:
                                 session.peer_verified = True
                     else:
                         attestation_error = verify_result.get('error', 'Attestation verification failed')
-                        logger.warning(f"Attestation verification failed for node {source_node_id}: {attestation_error}")
+                        logger.warning(f"Attestation verification failed for node {source_node_id}")
                 except Exception as e:
                     attestation_error = str(e)
                     logger.warning(f"Error verifying attestation from node {source_node_id}: {e}")
