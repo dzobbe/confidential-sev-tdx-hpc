@@ -27,6 +27,8 @@ import subprocess
 import shutil
 import urllib.parse
 import urllib.request
+import hashlib
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 import requests
 
@@ -45,6 +47,7 @@ AZ_HCL_HEADER_SIZE = 32
 TDREPORT_SIZE = 1024
 MRTD_OFFSET = 528  # MRTD location inside TDREPORT
 MRTD_SIZE = 48
+NV_REPORT_DATA = "0x01400002"  # NV index for user data (file hash)
 
 # Azure Instance Metadata Service (IMDS) endpoint
 IMDS_BASE = "http://169.254.169.254"
@@ -540,6 +543,73 @@ class AttestationQuoteGenerator:
         return quote_b64url
     
     @staticmethod
+    def _hash_file_and_write_to_nv(file_path: str) -> bytes:
+        """
+        Read a file, compute its SHA512 hash, and write it to TPM NV index 0x01400002.
+        
+        This method:
+        1. Reads the file content
+        2. Computes SHA512 hash (64 bytes)
+        3. Writes the hash to TPM NV index 0x01400002 using tpm2_nvwrite
+        
+        Args:
+            file_path: Path to the file to hash
+            
+        Returns:
+            SHA512 hash digest (64 bytes)
+            
+        Raises:
+            RuntimeError: If file cannot be read, tpm2_nvwrite is not available, or write fails
+        """
+        logger.debug(f"Hashing file and writing to NV index: {file_path}")
+        
+        # Read file content
+        try:
+            file_path_obj = Path(file_path)
+            if not file_path_obj.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            with open(file_path_obj, 'rb') as f:
+                file_content = f.read()
+            
+            logger.debug(f"File read successfully, length: {len(file_content)} bytes")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read file {file_path}: {e}") from e
+        
+        # Compute SHA512 hash (64 bytes)
+        digest = hashlib.sha512(file_content).digest()
+        logger.debug(f"SHA512 hash computed: {digest.hex()}")
+        
+        # Check if tpm2_nvwrite is available
+        if not AttestationQuoteGenerator._have_cmd("tpm2_nvwrite"):
+            raise RuntimeError(
+                "tpm2_nvwrite not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Write hash to TPM NV index 0x01400002
+        # Write exactly 64 bytes into NV 0x01400002
+        try:
+            subprocess.check_call(
+                [
+                    "tpm2_nvwrite",
+                    "-C", "o",
+                    NV_REPORT_DATA,
+                    "-i", "/dev/stdin"
+                ],
+                input=digest,
+                stderr=subprocess.PIPE
+            )
+            logger.info(f"Successfully wrote file hash to TPM NV index {NV_REPORT_DATA}")
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_nvwrite failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        
+        return digest
+    
+    @staticmethod
     def _extract_mrtd_from_tdx_quote(quote_bytes: bytes) -> Optional[bytes]:
         """
         Extract MRTD (Measurement Register Table Digest) from TDX quote
@@ -712,10 +782,11 @@ class AttestationQuoteGenerator:
         Generate TDX attestation quote using Azure IMDS endpoint
         
         This implementation:
-        1. Reads Azure HCL attestation report from TPM NV index 0x01400001 (2600 bytes)
-        2. Extracts the embedded 1024-byte TDREPORT (Intel TDX payload)
-        3. POSTs TDREPORT to Azure IMDS /acc/tdquote to obtain the quote
-        4. Extracts MRTD from TDREPORT and logs it
+        1. Hashes tee_server.py and writes it to TPM NV index 0x01400002 (for inclusion in attestation)
+        2. Reads Azure HCL attestation report from TPM NV index 0x01400001 (2600 bytes)
+        3. Extracts the embedded 1024-byte TDREPORT (Intel TDX payload)
+        4. POSTs TDREPORT to Azure IMDS /acc/tdquote to obtain the quote
+        5. Extracts MRTD from TDREPORT and logs it
         
         Args:
             nonce: Nonce bytes (currently not used by Azure IMDS endpoint, but kept for API compatibility)
@@ -731,6 +802,20 @@ class AttestationQuoteGenerator:
         logger.debug(f"Nonce length: {len(nonce)} bytes (note: nonce not currently used by IMDS endpoint)")
         
         try:
+            # Hash tee_server.py and write to TPM NV index 0x01400002
+            # This hash will be included in the attestation quote report data
+            try:
+                # Determine the path to tee_server.py relative to this file
+                current_file = Path(__file__)
+                # Navigate from src/attestation/azure_attestation.py to src/server/tee_server.py
+                tee_server_path = current_file.parent.parent / "server" / "tee_server.py"
+                logger.debug(f"Hashing tee_server.py and writing to NV index: {tee_server_path}")
+                file_hash = AttestationQuoteGenerator._hash_file_and_write_to_nv(str(tee_server_path))
+                logger.info(f"tee_server.py hash written to NV index {NV_REPORT_DATA}: {file_hash.hex()}")
+            except Exception as e:
+                logger.warning(f"Failed to hash and write tee_server.py to NV index: {e}")
+                logger.debug("Continuing with quote generation despite file hash write failure")
+            
             # Read HCL attestation report from vTPM
             logger.debug("Reading HCL attestation report from TPM NV index")
             hcl_blob = AttestationQuoteGenerator._read_hcl_report_from_vtpm()
