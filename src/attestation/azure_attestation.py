@@ -165,7 +165,6 @@ class AzureAttestationVerifier:
                 try:
                     error_detail = response.json()
                     error_msg += f": {error_detail}"
-                    logger.error(f"Azure Attestation Service error response: {error_detail}")
                     logger.error(f"Full error response: {json.dumps(error_detail, indent=2)}")
                 except Exception as e:
                     error_msg += f": {response.text}"
