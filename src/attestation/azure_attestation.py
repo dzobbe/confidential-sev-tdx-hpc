@@ -38,8 +38,17 @@ TPM_NV_INDEX_SNP = "0x01400001"
 SNP_REPORT_OFFSET = 32
 SNP_REPORT_SIZE = 1184
 
+# TDX constants
+TPM_NVINDEX_ATTESTATION_REPORT = "0x01400001"  # Same NV index as SEV, but different format
+TPM_NVINDEX_ATTESTATION_REPORT_SIZE = 2600
+AZ_HCL_HEADER_SIZE = 32
+TDREPORT_SIZE = 1024
+MRTD_OFFSET = 528  # MRTD location inside TDREPORT
+MRTD_SIZE = 48
+
 # Azure Instance Metadata Service (IMDS) endpoint
 IMDS_BASE = "http://169.254.169.254"
+IMDS_TDQUOTE_URL = f"{IMDS_BASE}/acc/tdquote"
 IMDS_HDRS = {"Metadata": "true"}
 
 
@@ -395,50 +404,152 @@ class AttestationQuoteGenerator:
         return base64.b64encode(data).decode("ascii")
     
     @staticmethod
-    def _print_mrtd(mrtd: Optional[bytes], source: str = "quote"):
+    def _read_hcl_report_from_vtpm() -> bytes:
         """
-        Print MRTD in base64 format
+        Reads the Azure HCL attestation report blob from vTPM NV index 0x01400001
+        using tpm2_nvread.
+        
+        Returns:
+            Raw HCL attestation report bytes (2600 bytes)
+            
+        Raises:
+            RuntimeError: If tpm2_nvread is not available or fails
+        """
+        if not AttestationQuoteGenerator._have_cmd("tpm2_nvread"):
+            raise RuntimeError(
+                "tpm2_nvread not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        cmd = [
+            "tpm2_nvread",
+            "-C",
+            "o",
+            TPM_NVINDEX_ATTESTATION_REPORT,
+            "-s",
+            str(TPM_NVINDEX_ATTESTATION_REPORT_SIZE),
+        ]
+        
+        try:
+            blob = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.output.decode("utf-8", errors="replace") if e.output else ""
+            raise RuntimeError(
+                "tpm2_nvread failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"Output:\n{stderr_msg}"
+            ) from e
+        
+        if len(blob) < TPM_NVINDEX_ATTESTATION_REPORT_SIZE:
+            raise RuntimeError(
+                f"Unexpected attestation report size: got {len(blob)} bytes, expected {TPM_NVINDEX_ATTESTATION_REPORT_SIZE}."
+            )
+        
+        # Basic sanity check: header signature should be 'HCLA'
+        sig = blob[0:4]
+        if sig != b"HCLA":
+            raise RuntimeError(
+                f"Unexpected HCL report signature {sig!r}. Expected b'HCLA'. Are you on an Azure confidential VM with vTPM?"
+            )
+        
+        return blob
+    
+    @staticmethod
+    def _extract_tdreport(hcl_blob: bytes) -> bytes:
+        """
+        Extract the 1024-byte TDREPORT from the Azure HCL attestation report.
         
         Args:
-            mrtd: MRTD bytes or None
-            source: Source description for logging
+            hcl_blob: Raw HCL attestation report bytes
+            
+        Returns:
+            TDREPORT bytes (1024 bytes)
+            
+        Raises:
+            RuntimeError: If HCL blob is too small
         """
-        if mrtd:
-            try:
-                # Handle different types
-                if isinstance(mrtd, str):
-                    # If it's already a string, try to decode if it's base64
-                    try:
-                        mrtd_bytes = base64.b64decode(mrtd)
-                        mrtd_b64 = mrtd
-                    except:
-                        mrtd_b64 = base64.b64encode(mrtd.encode('utf-8')).decode('utf-8')
-                elif isinstance(mrtd, bytes):
-                    mrtd_b64 = base64.b64encode(mrtd).decode('utf-8')
-                else:
-                    # Try to convert to bytes
-                    mrtd_bytes = bytes(mrtd)
-                    mrtd_b64 = base64.b64encode(mrtd_bytes).decode('utf-8')
-                
-                print(f"MRTD (base64): {mrtd_b64}")
-                logger.info(f"MRTD extracted from {source}: {mrtd_b64}")
-            except Exception as e:
-                logger.error(f"Error formatting MRTD for printing: {e}")
-        else:
-            logger.warning(f"Could not extract MRTD from {source}")
+        start = AZ_HCL_HEADER_SIZE
+        end = start + TDREPORT_SIZE
+        if len(hcl_blob) < end:
+            raise RuntimeError("HCL report blob too small to contain a TDREPORT payload.")
+        return hcl_blob[start:end]
+    
+    @staticmethod
+    def _extract_mrtd_from_tdreport(tdreport: bytes) -> bytes:
+        """
+        Extract the 48-byte MRTD from the TDREPORT.
+        
+        Args:
+            tdreport: TDREPORT bytes (1024 bytes)
+            
+        Returns:
+            MRTD bytes (48 bytes)
+            
+        Raises:
+            RuntimeError: If TDREPORT is invalid size or doesn't contain MRTD
+        """
+        if len(tdreport) != TDREPORT_SIZE:
+            raise RuntimeError(f"TDREPORT must be {TDREPORT_SIZE} bytes; got {len(tdreport)} bytes.")
+        start = MRTD_OFFSET
+        end = start + MRTD_SIZE
+        if end > len(tdreport):
+            raise RuntimeError("TDREPORT too small to contain MRTD at the expected offset.")
+        return tdreport[start:end]
+    
+    @staticmethod
+    def _get_tdquote_from_imds(tdreport: bytes) -> str:
+        """
+        Call Azure IMDS to obtain a TDX quote.
+        
+        Args:
+            tdreport: TDREPORT bytes (1024 bytes)
+            
+        Returns:
+            Quote as base64url string (no padding)
+            
+        Raises:
+            RuntimeError: If IMDS call fails or response is invalid
+        """
+        report_b64url = AttestationQuoteGenerator._b64url(tdreport, pad=False)
+        body = json.dumps({"report": report_b64url}).encode("utf-8")
+        
+        req = urllib.request.Request(
+            IMDS_TDQUOTE_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp_body = resp.read()
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to call Azure IMDS tdquote endpoint. "
+                "Ensure you are running inside an Azure TDX CVM and IMDS is reachable."
+            ) from e
+        
+        try:
+            payload = json.loads(resp_body.decode("utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"IMDS response was not valid JSON: {resp_body!r}") from e
+        
+        quote_b64url = payload.get("quote")
+        if not isinstance(quote_b64url, str) or not quote_b64url:
+            raise RuntimeError(f"IMDS JSON did not contain a valid 'quote' field: {payload!r}")
+        
+        return quote_b64url
     
     @staticmethod
     def _extract_mrtd_from_tdx_quote(quote_bytes: bytes) -> Optional[bytes]:
         """
         Extract MRTD (Measurement Register Table Digest) from TDX quote
         
-        TDX quote structure can vary, but typically contains:
-        - Quote header/metadata (variable size)
+        TDX quote structure:
+        - Quote header (variable size, typically 48 bytes)
         - TD report (144 bytes) - contains MRTD at offset 0x80 (128 bytes)
-        - Certificates and signature data (variable size)
+        - Signature data (variable size)
         
         MRTD is a 48-byte SHA384 digest located at offset 0x80 within the TD report.
-        This function searches through the quote to find the TD report section.
         
         Args:
             quote_bytes: Raw TDX quote bytes
@@ -447,22 +558,21 @@ class AttestationQuoteGenerator:
             MRTD bytes (48 bytes) or None if extraction fails
         """
         try:
-            mrtd_size = 48
-            td_report_size = 144
-            mrtd_offset_in_report = 128  # Offset within TD report
+            # TD report is 144 bytes and typically starts after the quote header
+            # The quote header is typically 48 bytes for TDX quotes
+            # MRTD is at offset 0x80 (128 bytes) from the start of the TD report
             
             # Try different possible offsets for TD report start
-            # TDX quotes can have variable header sizes depending on format
-            # Try a wider range of header sizes
-            possible_header_sizes = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 256, 512]
+            # Common TDX quote header sizes: 48, 64, or 80 bytes
+            possible_header_sizes = [48, 64, 80]
             
             for header_size in possible_header_sizes:
-                if len(quote_bytes) < header_size + td_report_size:
+                if len(quote_bytes) < header_size + 144:
                     continue
                 
                 # TD report starts after header
                 td_report_start = header_size
-                td_report_end = td_report_start + td_report_size
+                td_report_end = td_report_start + 144
                 
                 if len(quote_bytes) < td_report_end:
                     continue
@@ -471,33 +581,19 @@ class AttestationQuoteGenerator:
                 td_report = quote_bytes[td_report_start:td_report_end]
                 
                 # MRTD is at offset 0x80 (128 bytes) within TD report, 48 bytes long
-                if len(td_report) >= mrtd_offset_in_report + mrtd_size:
-                    mrtd = td_report[mrtd_offset_in_report:mrtd_offset_in_report + mrtd_size]
-                    # Validate: MRTD should not be all zeros (unlikely but possible)
-                    if mrtd != b'\x00' * mrtd_size:
-                        logger.debug(f"Extracted MRTD using header size {header_size} bytes")
-                        return mrtd
+                mrtd_offset = 128
+                mrtd_size = 48
+                
+                if len(td_report) >= mrtd_offset + mrtd_size:
+                    mrtd = td_report[mrtd_offset:mrtd_offset + mrtd_size]
+                    logger.debug(f"Extracted MRTD using header size {header_size} bytes")
+                    return mrtd
             
-            # If standard offsets don't work, try sliding window approach
-            # Search for TD report pattern by looking for MRTD-like patterns
-            # TD report has specific structure, but we can search for non-zero 48-byte chunks
-            # at positions that could be MRTD (offset 128 within a 144-byte window)
-            logger.debug("Trying sliding window approach to find TD report")
-            for start_offset in range(0, min(len(quote_bytes) - td_report_size, 2000), 16):
-                td_report = quote_bytes[start_offset:start_offset + td_report_size]
-                if len(td_report) >= mrtd_offset_in_report + mrtd_size:
-                    mrtd = td_report[mrtd_offset_in_report:mrtd_offset_in_report + mrtd_size]
-                    # Check if this looks like a valid MRTD (not all zeros, not all 0xFF)
-                    if mrtd != b'\x00' * mrtd_size and mrtd != b'\xff' * mrtd_size:
-                        # Additional validation: check if surrounding bytes look reasonable
-                        # TD report should have some structure, not random data
-                        logger.debug(f"Found potential MRTD at offset {start_offset + mrtd_offset_in_report}")
-                        return mrtd
-            
-            # If still not found, log detailed info for debugging
+            # If standard offsets don't work, try to find TD report by looking for known patterns
+            # TD report typically starts with version field (4 bytes) and other known fields
+            # For now, log a warning and return None
             logger.warning(f"Could not extract MRTD from quote (length: {len(quote_bytes)} bytes)")
-            logger.debug(f"Quote first 200 bytes (hex): {quote_bytes[:200].hex()}")
-            logger.debug(f"Quote last 200 bytes (hex): {quote_bytes[-200:].hex()}")
+            logger.debug(f"Quote first 100 bytes (hex): {quote_bytes[:100].hex()}")
             return None
             
         except Exception as e:
@@ -610,177 +706,70 @@ class AttestationQuoteGenerator:
             logger.exception("Exception details:")
             raise 
         
+    @staticmethod
     def generate_tdx_quote(nonce: bytes) -> bytes:
         """
-        Generate TDX attestation quote using Intel Trust Authority Client library
+        Generate TDX attestation quote using Azure IMDS endpoint
         
-        Uses AzureTDXAdapter from inteltrustauthorityclient to collect TDX evidence
-        from the TEE environment.
+        This implementation:
+        1. Reads Azure HCL attestation report from TPM NV index 0x01400001 (2600 bytes)
+        2. Extracts the embedded 1024-byte TDREPORT (Intel TDX payload)
+        3. POSTs TDREPORT to Azure IMDS /acc/tdquote to obtain the quote
+        4. Extracts MRTD from TDREPORT and logs it
         
         Args:
-            nonce: Nonce bytes to include in the quote
+            nonce: Nonce bytes (currently not used by Azure IMDS endpoint, but kept for API compatibility)
             
         Returns:
-            Raw TDX quote bytes
+            Raw TDX quote bytes (decoded from base64url response)
             
         Raises:
-            ImportError: If Intel Trust Authority Client library is not installed
-            Exception: If evidence collection fails (e.g., not in TDX environment,
-                      missing permissions, or TDX not properly configured)
+            RuntimeError: If tpm2_nvread is not available, TPM read fails, or IMDS call fails
+            Exception: For other errors during quote generation
         """
         logger.info("Generating TDX attestation quote")
-        logger.debug(f"Nonce length: {len(nonce)} bytes")
-        
-        # Import TDX-specific libraries only when needed (not available on SEV machines)
-        try:
-            from inteltrustauthorityclient.tdx.tdx_adapter import TDXAdapter
-            from inteltrustauthorityclient.tdx.azure.azure_tdx_adapter import AzureTDXAdapter
-        except ImportError as e:
-            logger.error(f"Intel Trust Authority Client library not available: {e}")
-            logger.error("TDX libraries are only available on TDX-enabled machines")
-            raise ImportError(
-                "Intel Trust Authority Client library is not installed or not available. "
-                "This library is only available on TDX-enabled machines. "
-                f"Original error: {e}"
-            )
+        logger.debug(f"Nonce length: {len(nonce)} bytes (note: nonce not currently used by IMDS endpoint)")
         
         try:
-            # Create Azure TDX adapter
-            # Note: user_data is optional, can be None or base64-encoded string
-            logger.debug("Creating AzureTDXAdapter instance")
-            adapter = AzureTDXAdapter(user_data=None)
+            # Read HCL attestation report from vTPM
+            logger.debug("Reading HCL attestation report from TPM NV index")
+            hcl_blob = AttestationQuoteGenerator._read_hcl_report_from_vtpm()
+            logger.debug(f"HCL report read, length: {len(hcl_blob)} bytes")
             
-            # Collect evidence (quote) from TDX TEE
-            # The nonce is passed to include it in the quote
-            logger.debug("Collecting evidence from TDX TEE")
-            evidence = adapter.collect_evidence(nonce=nonce)
-            logger.debug(f"Evidence collected, type: {type(evidence)}")
-            logger.debug(f"Evidence object attributes: {[attr for attr in dir(evidence) if not attr.startswith('_')]}")
+            # Extract TDREPORT from HCL report
+            logger.debug("Extracting TDREPORT from HCL report")
+            tdreport = AttestationQuoteGenerator._extract_tdreport(hcl_blob)
+            logger.debug(f"TDREPORT extracted, length: {len(tdreport)} bytes")
             
-            # First, check if evidence object has MRTD directly
-            mrtd_from_evidence = None
-            if hasattr(evidence, 'mrtd'):
-                mrtd_from_evidence = evidence.mrtd
-                logger.debug("Found MRTD directly in evidence object")
-            elif hasattr(evidence, 'tdx_mrtd'):
-                mrtd_from_evidence = evidence.tdx_mrtd
-                logger.debug("Found tdx_mrtd in evidence object")
-            elif hasattr(evidence, 'td_report'):
-                # Check if td_report has MRTD
-                td_report = evidence.td_report
-                if hasattr(td_report, 'mrtd'):
-                    mrtd_from_evidence = td_report.mrtd
-                    logger.debug("Found MRTD in td_report")
+            # Extract MRTD from TDREPORT and print/log it
+            try:
+                mrtd = AttestationQuoteGenerator._extract_mrtd_from_tdreport(tdreport)
+                mrtd_b64 = AttestationQuoteGenerator._b64_std(mrtd)
+                print(f"MRTD_BASE64: {mrtd_b64}")
+                logger.info(f"MRTD extracted from TDREPORT: {mrtd_b64}")
+            except Exception as e:
+                logger.warning(f"Could not extract MRTD from TDREPORT: {e}")
             
-            # Extract quote from evidence object
-            # The quote field may be base64-encoded or raw bytes
-            if hasattr(evidence, 'quote'):
-                logger.debug("Evidence object has 'quote' attribute")
-                quote_value = evidence.quote
-                logger.debug(f"Quote value type: {type(quote_value)}, length: {len(quote_value) if hasattr(quote_value, '__len__') else 'N/A'}")
-                
-                # Handle base64-encoded quote
-                if isinstance(quote_value, str):
-                    logger.debug("Quote is string, attempting base64 decode")
-                    try:
-                        # Try to decode base64
-                        quote_bytes = base64.b64decode(quote_value)
-                        logger.info(f"Successfully decoded base64 quote, length: {len(quote_bytes)} bytes")
-                        # Extract and print MRTD
-                        mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                        AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
-                        return quote_bytes
-                    except Exception as e:
-                        logger.warning(f"Base64 decode failed: {e}, trying base64url")
-                        # If decoding fails, might be base64url encoded
-                        try:
-                            # Replace base64url characters
-                            quote_b64 = quote_value.replace('-', '+').replace('_', '/')
-                            # Add padding if needed
-                            padding = len(quote_b64) % 4
-                            if padding:
-                                quote_b64 += '=' * (4 - padding)
-                            quote_bytes = base64.b64decode(quote_b64)
-                            logger.info(f"Successfully decoded base64url quote, length: {len(quote_bytes)} bytes")
-                            # Extract and print MRTD
-                            mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                            AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
-                            return quote_bytes
-                        except Exception as e2:
-                            logger.error(f"Failed to decode quote as base64 or base64url: {e2}")
-                            logger.exception("Decode exception details:")
-                            raise ValueError(f"Failed to decode quote: {str(e2)}")
-                elif isinstance(quote_value, bytes):
-                    # Already bytes, return directly
-                    logger.info(f"Quote is already bytes, length: {len(quote_value)} bytes")
-                    # Extract and print MRTD
-                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_value)
-                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
-                    return quote_value
-                else:
-                    # Try to convert to bytes
-                    logger.warning(f"Quote is unexpected type {type(quote_value)}, attempting conversion")
-                    quote_bytes = bytes(quote_value)
-                    # Extract and print MRTD
-                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else "quote")
-                    return quote_bytes
-            else:
-                logger.warning("Evidence object does not have 'quote' attribute, searching alternatives")
-                # If quote field not found, try common alternative field names
-                for field_name in ['tdx_quote', 'raw_quote', 'evidence', 'report']:
-                    if hasattr(evidence, field_name):
-                        logger.debug(f"Found alternative field: {field_name}")
-                        field_value = getattr(evidence, field_name)
-                        if isinstance(field_value, bytes):
-                            logger.info(f"Using {field_name} as bytes, length: {len(field_value)} bytes")
-                            # Extract and print MRTD
-                            mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(field_value)
-                            AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
-                            return field_value
-                        elif isinstance(field_value, str):
-                            logger.info(f"Using {field_name} as string, attempting to decode")
-                            logger.debug(f"Field value type: {type(field_value)}, length: {len(field_value)}")
-                            # Try base64 decode first
-                            try:
-                                quote_bytes = base64.b64decode(field_value)
-                                logger.info(f"Successfully decoded {field_name} as base64, length: {len(quote_bytes)} bytes")
-                                # Extract and print MRTD
-                                mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                                AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
-                                return quote_bytes
-                            except Exception as e:
-                                logger.debug(f"Base64 decode failed for {field_name}: {e}, trying base64url")
-                                # If decoding fails, might be base64url encoded
-                                try:
-                                    # Replace base64url characters
-                                    quote_b64 = field_value.replace('-', '+').replace('_', '/')
-                                    # Add padding if needed
-                                    padding = len(quote_b64) % 4
-                                    if padding:
-                                        quote_b64 += '=' * (4 - padding)
-                                    quote_bytes = base64.b64decode(quote_b64)
-                                    logger.info(f"Successfully decoded {field_name} as base64url, length: {len(quote_bytes)} bytes")
-                                    # Extract and print MRTD
-                                    mrtd = mrtd_from_evidence if mrtd_from_evidence else AttestationQuoteGenerator._extract_mrtd_from_tdx_quote(quote_bytes)
-                                    AttestationQuoteGenerator._print_mrtd(mrtd, "evidence" if mrtd_from_evidence else field_name)
-                                    return quote_bytes
-                                except Exception as e2:
-                                    logger.warning(f"Failed to decode {field_name} as base64 or base64url: {e2}")
-                                    logger.debug(f"Field value preview (first 100 chars): {field_value[:100]}")
-                                    # Continue to next field instead of failing immediately
-                                    continue
-                
-                # If no quote found, raise error
-                # But first, print MRTD if we found it in evidence
-                if mrtd_from_evidence:
-                    AttestationQuoteGenerator._print_mrtd(mrtd_from_evidence, "evidence")
-                logger.error("Evidence object does not contain a quote field")
-                logger.error(f"Available attributes: {dir(evidence)}")
-                raise ValueError("Evidence object does not contain a quote field")
-        except ImportError as e:
-            logger.error(f"Import error: Intel Trust Authority Client library not available: {e}")
-            logger.exception("Import exception details:")
+            # Call Azure IMDS to get the quote
+            logger.debug("Calling Azure IMDS tdquote endpoint")
+            quote_b64url = AttestationQuoteGenerator._get_tdquote_from_imds(tdreport)
+            logger.debug(f"Quote received from IMDS, length: {len(quote_b64url)} characters")
+            
+            # Decode base64url quote to bytes
+            # Replace base64url characters and add padding if needed
+            quote_b64 = quote_b64url.replace('-', '+').replace('_', '/')
+            padding = len(quote_b64) % 4
+            if padding:
+                quote_b64 += '=' * (4 - padding)
+            
+            quote_bytes = base64.b64decode(quote_b64)
+            logger.info(f"TDX quote generated successfully, length: {len(quote_bytes)} bytes")
+            
+            return quote_bytes
+            
+        except RuntimeError as e:
+            logger.error(f"Failed to generate TDX quote: {e}")
+            logger.exception("Runtime error details:")
             raise
         except Exception as e:
             logger.error(f"Failed to generate TDX quote: {e}")
