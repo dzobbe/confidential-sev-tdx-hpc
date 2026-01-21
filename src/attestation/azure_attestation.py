@@ -545,6 +545,78 @@ class AttestationQuoteGenerator:
         return quote_b64url
     
     @staticmethod
+    def _hash_file_and_extend_to_pcr(file_path: str, pcr_number: int = 23) -> bytes:
+        """
+        Read a file, compute its SHA256 hash, and extend it to a TPM PCR.
+        
+        This method follows the recommended approach for SEV-SNP runtime/user data:
+        1. Reads the file content
+        2. Computes SHA256 hash (32 bytes)
+        3. Extends the hash to the specified PCR using tpm2_pcrextend
+        
+        According to Microsoft documentation, PCR23 is recommended for user mode 
+        components or runtime data in Azure confidential VMs.
+        
+        Args:
+            file_path: Path to the file to hash
+            pcr_number: PCR number to extend (default: 23, recommended for user/runtime data)
+            
+        Returns:
+            SHA256 hash digest (32 bytes)
+            
+        Raises:
+            RuntimeError: If file cannot be read, tpm2_pcrextend is not available, or extend fails
+        """
+        logger.debug(f"Hashing file and extending to PCR{pcr_number}: {file_path}")
+        
+        # Read file content
+        try:
+            file_path_obj = Path(file_path)
+            if not file_path_obj.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            with open(file_path_obj, 'rb') as f:
+                file_content = f.read()
+            
+            logger.debug(f"File read successfully, length: {len(file_content)} bytes")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read file {file_path}: {e}") from e
+        
+        # Compute SHA256 hash (32 bytes) - PCRs use SHA256
+        digest = hashlib.sha256(file_content).digest()
+        digest_hex = digest.hex()
+        logger.debug(f"SHA256 hash computed: {digest_hex}")
+        
+        # Check if tpm2_pcrextend is available
+        if not AttestationQuoteGenerator._have_cmd("tpm2_pcrextend"):
+            raise RuntimeError(
+                "tpm2_pcrextend not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Extend hash to PCR using tpm2_pcrextend
+        # Format: tpm2_pcrextend <pcr_number>:sha256=<hash_hex>
+        try:
+            proc = subprocess.run(
+                [
+                    "tpm2_pcrextend",
+                    f"{pcr_number}:sha256={digest_hex}"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            logger.info(f"Successfully extended file hash to PCR{pcr_number}")
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_pcrextend failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"PCR: {pcr_number}, Hash: {digest_hex}\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        
+        return digest
+    
+    @staticmethod
     def _hash_file_and_write_to_nv(file_path: str) -> bytes:
         """
         Read a file, compute its SHA512 hash, and write it to TPM NV index 0x01400002.
@@ -738,17 +810,18 @@ class AttestationQuoteGenerator:
         """
         Generate SEV-SNP attestation quote for Azure MAA
         
-        This implementation:
-        1. Hashes tee_server.py and writes it to TPM NV index 0x01400002 (for inclusion in attestation)
+        This implementation follows the recommended approach from Microsoft Learn:
+        https://learn.microsoft.com/en-us/azure/confidential-computing/how-to-leverage-virtual-tpms-in-azure-confidential-vms
+        
+        1. Hashes tee_server.py and extends it to PCR23 (recommended for user/runtime data)
         2. Reads the SNP report from TPM NV index using tpm2_nvread
         3. Extracts the raw 1184-byte SNP report
         4. Fetches the VCEK certificate chain from Azure THIM endpoint
         5. Builds the MAA report field format (base64url of JSON containing SnpReport and VcekCertChain)
         
-        Note: The report data written to NV index 0x01400002 (64 bytes) will be included in the
-        SEV-SNP report's REPORT_DATA field and surfaced in Azure attestation claims as runtime data.
-        However, the hardware report itself is typically generated at boot time, so the report data
-        may appear in runtime claims rather than the hardware report's REPORT_DATA field.
+        Note: PCR23 measurements are cryptographically linked to the SEV-SNP report through the
+        AKPub (Attestation Key Public) in the report. The PCR measurements can be verified using
+        tpm2_quote to create a chain of trust from the SEV-SNP hardware report to runtime measurements.
         
         Args:
             nonce: Nonce bytes (currently not used in SNP report extraction, but kept for API compatibility)
@@ -765,24 +838,23 @@ class AttestationQuoteGenerator:
         logger.debug(f"Nonce length: {len(nonce)} bytes")
         
         try:
-            # Hash tee_server.py and write to TPM NV index 0x01400002
-            # This hash will be included in the attestation quote report data (runtime claims)
-            # Note: SEV-SNP hardware reports are typically generated at boot, so this data
-            # may appear in runtime claims rather than the hardware REPORT_DATA field
+            # Hash tee_server.py and extend to PCR23 (recommended for user/runtime data)
+            # PCR23 measurements are cryptographically linked to the SEV-SNP report through AKPub
+            # This follows the recommended approach from Microsoft Learn documentation
             try:
                 # Determine the path to tee_server.py relative to this file
                 current_file = Path(__file__)
                 # Navigate from src/attestation/azure_attestation.py to src/server/tee_server.py
                 tee_server_path = current_file.parent.parent / "server" / "tee_server.py"
-                logger.debug(f"Hashing tee_server.py and writing to NV index: {tee_server_path}")
-                file_hash = AttestationQuoteGenerator._hash_file_and_write_to_nv(str(tee_server_path))
+                logger.debug(f"Hashing tee_server.py and extending to PCR23: {tee_server_path}")
+                file_hash = AttestationQuoteGenerator._hash_file_and_extend_to_pcr(str(tee_server_path), pcr_number=23)
                 file_hash_b64 = AttestationQuoteGenerator._b64_std(file_hash)
                 print(f"TEE_SERVER_HASH_BASE64: {file_hash_b64}")
-                logger.info(f"tee_server.py hash written to NV index {NV_REPORT_DATA}: {file_hash.hex()}")
+                logger.info(f"tee_server.py hash extended to PCR23: {file_hash.hex()}")
                 logger.info(f"tee_server.py hash (base64): {file_hash_b64}")
             except Exception as e:
-                logger.warning(f"Failed to hash and write tee_server.py to NV index: {e}")
-                logger.debug("Continuing with quote generation despite file hash write failure")
+                logger.warning(f"Failed to hash and extend tee_server.py to PCR23: {e}")
+                logger.debug("Continuing with quote generation despite PCR extend failure")
             
             # Read SNP report from TPM NV index
             logger.debug("Reading SNP report from TPM NV index")
