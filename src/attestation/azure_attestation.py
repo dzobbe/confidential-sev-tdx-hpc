@@ -545,78 +545,6 @@ class AttestationQuoteGenerator:
         return quote_b64url
     
     @staticmethod
-    def _hash_file_and_extend_to_pcr(file_path: str, pcr_number: int = 23) -> bytes:
-        """
-        Read a file, compute its SHA256 hash, and extend it to a TPM PCR.
-        
-        This method follows the recommended approach for SEV-SNP runtime/user data:
-        1. Reads the file content
-        2. Computes SHA256 hash (32 bytes)
-        3. Extends the hash to the specified PCR using tpm2_pcrextend
-        
-        According to Microsoft documentation, PCR23 is recommended for user mode 
-        components or runtime data in Azure confidential VMs.
-        
-        Args:
-            file_path: Path to the file to hash
-            pcr_number: PCR number to extend (default: 23, recommended for user/runtime data)
-            
-        Returns:
-            SHA256 hash digest (32 bytes)
-            
-        Raises:
-            RuntimeError: If file cannot be read, tpm2_pcrextend is not available, or extend fails
-        """
-        logger.debug(f"Hashing file and extending to PCR{pcr_number}: {file_path}")
-        
-        # Read file content
-        try:
-            file_path_obj = Path(file_path)
-            if not file_path_obj.exists():
-                raise FileNotFoundError(f"File not found: {file_path}")
-            
-            with open(file_path_obj, 'rb') as f:
-                file_content = f.read()
-            
-            logger.debug(f"File read successfully, length: {len(file_content)} bytes")
-        except Exception as e:
-            raise RuntimeError(f"Failed to read file {file_path}: {e}") from e
-        
-        # Compute SHA256 hash (32 bytes) - PCRs use SHA256
-        digest = hashlib.sha256(file_content).digest()
-        digest_hex = digest.hex()
-        logger.debug(f"SHA256 hash computed: {digest_hex}")
-        
-        # Check if tpm2_pcrextend is available
-        if not AttestationQuoteGenerator._have_cmd("tpm2_pcrextend"):
-            raise RuntimeError(
-                "tpm2_pcrextend not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
-            )
-        
-        # Extend hash to PCR using tpm2_pcrextend
-        # Format: tpm2_pcrextend <pcr_number>:sha256=<hash_hex>
-        try:
-            proc = subprocess.run(
-                [
-                    "tpm2_pcrextend",
-                    f"{pcr_number}:sha256={digest_hex}"
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
-            logger.info(f"Successfully extended file hash to PCR{pcr_number}")
-        except subprocess.CalledProcessError as e:
-            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-            raise RuntimeError(
-                f"tpm2_pcrextend failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
-                f"PCR: {pcr_number}, Hash: {digest_hex}\n"
-                f"stderr:\n{stderr_msg}"
-            ) from e
-        
-        return digest
-    
-    @staticmethod
     def _hash_file_and_write_to_nv(file_path: str) -> bytes:
         """
         Read a file, compute its SHA512 hash, and write it to TPM NV index 0x01400002.
@@ -786,15 +714,20 @@ class AttestationQuoteGenerator:
         return pem
     
     @staticmethod
-    def _build_maa_report_field(raw_snp_report: bytes, vcek_chain_pem: bytes) -> str:
+    def _build_maa_report_field(raw_snp_report: bytes, vcek_chain_pem: bytes, tpm_quote: Optional[Dict[str, bytes]] = None) -> str:
         """
         Build the outer MAA request field 'report' as base64url(inner_json_bytes),
         where inner JSON has SnpReport (base64url of raw SNP report bytes) and
-        VcekCertChain (standard base64 of PEM bytes).
+        VcekCertChain (standard base64 of PEM bytes), and optionally TPM quote data.
         
         Note: MAA's "report" field is NOT the raw 1184-byte SNP report.
-        It is base64url( JSON( { "SnpReport": b64url(raw_report), "VcekCertChain": b64(pem_chain) } ) )
+        It is base64url( JSON( { "SnpReport": b64url(raw_report), "VcekCertChain": b64(pem_chain), ... } ) )
         
+        Args:
+            raw_snp_report: Raw 1184-byte SNP report bytes
+            vcek_chain_pem: VCEK certificate chain as PEM bytes
+            tpm_quote: Optional TPM quote dictionary with 'message', 'signature', and 'pcrs' keys
+            
         Returns:
             Base64URL-encoded JSON string ready for MAA attestation request
         """
@@ -802,29 +735,266 @@ class AttestationQuoteGenerator:
             "SnpReport": AttestationQuoteGenerator._b64url(raw_snp_report),
             "VcekCertChain": AttestationQuoteGenerator._b64_std(vcek_chain_pem),
         }
+        
+        # Add TPM quote data if provided
+        if tpm_quote:
+            inner["TpmQuote"] = {
+                "message": AttestationQuoteGenerator._b64url(tpm_quote['message']),
+                "signature": AttestationQuoteGenerator._b64url(tpm_quote['signature']),
+                "pcrs": AttestationQuoteGenerator._b64url(tpm_quote['pcrs'])
+            }
+            logger.debug("TPM quote data added to MAA report field")
+        
         inner_bytes = json.dumps(inner, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return AttestationQuoteGenerator._b64url(inner_bytes)
     
     @staticmethod
-    def generate_sev_quote(nonce: bytes) -> bytes:
+    def _hash_file_and_extend_pcr(file_path: str, pcr_index: int = 23) -> bytes:
         """
-        Generate SEV-SNP attestation quote for Azure MAA
+        Read a file, compute its SHA256 hash, and extend it into a TPM PCR.
         
-        This implementation follows the recommended approach from Microsoft Learn:
-        https://learn.microsoft.com/en-us/azure/confidential-computing/how-to-leverage-virtual-tpms-in-azure-confidential-vms
-        
-        1. Hashes tee_server.py and extends it to PCR23 (recommended for user/runtime data)
-        2. Reads the SNP report from TPM NV index using tpm2_nvread
-        3. Extracts the raw 1184-byte SNP report
-        4. Fetches the VCEK certificate chain from Azure THIM endpoint
-        5. Builds the MAA report field format (base64url of JSON containing SnpReport and VcekCertChain)
-        
-        Note: PCR23 measurements are cryptographically linked to the SEV-SNP report through the
-        AKPub (Attestation Key Public) in the report. The PCR measurements can be verified using
-        tpm2_quote to create a chain of trust from the SEV-SNP hardware report to runtime measurements.
+        This method:
+        1. Reads the file content
+        2. Computes SHA256 hash (32 bytes)
+        3. Extends the hash into the specified PCR using tpm2_pcrextend
         
         Args:
-            nonce: Nonce bytes (currently not used in SNP report extraction, but kept for API compatibility)
+            file_path: Path to the file to hash
+            pcr_index: PCR index to extend (default: 23 for user mode/runtime data)
+            
+        Returns:
+            SHA256 hash digest (32 bytes)
+            
+        Raises:
+            RuntimeError: If file cannot be read, tpm2_pcrextend is not available, or extend fails
+        """
+        logger.debug(f"Hashing file and extending PCR {pcr_index}: {file_path}")
+        
+        # Read file content
+        try:
+            file_path_obj = Path(file_path)
+            if not file_path_obj.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            with open(file_path_obj, 'rb') as f:
+                file_content = f.read()
+            
+            logger.debug(f"File read successfully, length: {len(file_content)} bytes")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read file {file_path}: {e}") from e
+        
+        # Compute SHA256 hash (32 bytes)
+        digest = hashlib.sha256(file_content).digest()
+        logger.debug(f"SHA256 hash computed: {digest.hex()}")
+        
+        # Check if tpm2_pcrextend is available
+        if not AttestationQuoteGenerator._have_cmd("tpm2_pcrextend"):
+            raise RuntimeError(
+                "tpm2_pcrextend not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Extend hash into PCR using tpm2_pcrextend
+        # Format: tpm2_pcrextend <pcr_index>:sha256=<hash_hex>
+        hash_hex = digest.hex()
+        cmd = [
+            "tpm2_pcrextend",
+            f"{pcr_index}:sha256={hash_hex}"
+        ]
+        
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            logger.info(f"Successfully extended file hash into PCR {pcr_index}")
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_pcrextend failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        
+        return digest
+    
+    @staticmethod
+    def _read_akpub_from_vtpm() -> bytes:
+        """
+        Read the vTPM Attestation Key (AK) public key from NV index 0x81000003.
+        
+        Returns:
+            AK public key as PEM bytes
+            
+        Raises:
+            RuntimeError: If tpm2_readpublic is not available or read fails
+        """
+        logger.debug("Reading vTPM AK public key from NV index 0x81000003")
+        
+        if not AttestationQuoteGenerator._have_cmd("tpm2_readpublic"):
+            raise RuntimeError(
+                "tpm2_readpublic not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Create temporary file for AK public key output
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pem') as akpub_file:
+            akpub_path = akpub_file.name
+        
+        try:
+            # Read AK public key
+            cmd = [
+                "tpm2_readpublic",
+                "-c", "0x81000003",  # AK context handle
+                "-f", "pem",         # Output format: PEM
+                "-o", akpub_path     # Output file
+            ]
+            
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            
+            # Read the AK public key
+            with open(akpub_path, 'rb') as f:
+                akpub_pem = f.read()
+            
+            logger.info("vTPM AK public key read successfully")
+            logger.debug(f"AK public key length: {len(akpub_pem)} bytes")
+            
+            return akpub_pem
+            
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_readpublic failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(akpub_path)
+            except Exception:
+                pass  # Ignore cleanup errors
+    
+    @staticmethod
+    def _generate_tpm_quote(nonce: bytes, pcr_list: list = [15, 16, 22, 23]) -> Dict[str, bytes]:
+        """
+        Generate a TPM quote using the vTPM's attestation key.
+        
+        This method:
+        1. Uses tpm2_quote to generate a quote with specified PCRs
+        2. Returns the quote message, signature, and PCR values
+        
+        Args:
+            nonce: Nonce bytes for freshness (will be converted to hex)
+            pcr_list: List of PCR indices to quote (default: [15, 16, 22, 23])
+            
+        Returns:
+            Dictionary with keys:
+                - 'message': Quote message bytes
+                - 'signature': Quote signature bytes
+                - 'pcrs': PCR values bytes
+                
+        Raises:
+            RuntimeError: If tpm2_quote is not available or quote generation fails
+        """
+        logger.debug(f"Generating TPM quote with PCRs: {pcr_list}, nonce length: {len(nonce)} bytes")
+        
+        # Check if tpm2_quote is available
+        if not AttestationQuoteGenerator._have_cmd("tpm2_quote"):
+            raise RuntimeError(
+                "tpm2_quote not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Convert nonce to hex string
+        nonce_hex = nonce.hex()
+        
+        # Build PCR selection string (e.g., "sha256:15,16,22,23")
+        pcr_selection = "sha256:" + ",".join(map(str, pcr_list))
+        
+        # Create temporary files for quote outputs
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.msg') as msg_file, \
+             tempfile.NamedTemporaryFile(delete=False, suffix='.sig') as sig_file, \
+             tempfile.NamedTemporaryFile(delete=False, suffix='.pcrs') as pcrs_file:
+            
+            msg_path = msg_file.name
+            sig_path = sig_file.name
+            pcrs_path = pcrs_file.name
+        
+        try:
+            # Generate TPM quote
+            # AK context handle: 0x81000003 (vTPM attestation key)
+            cmd = [
+                "tpm2_quote",
+                "-c", "0x81000003",  # AK context handle
+                "-l", pcr_selection,  # PCR selection
+                "-q", nonce_hex,       # Nonce (hex string)
+                "-m", msg_path,       # Message output file
+                "-s", sig_path,       # Signature output file
+                "-o", pcrs_path,      # PCR values output file
+                "-g", "sha256"       # Hash algorithm
+            ]
+            
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            
+            # Read the output files
+            with open(msg_path, 'rb') as f:
+                message = f.read()
+            with open(sig_path, 'rb') as f:
+                signature = f.read()
+            with open(pcrs_path, 'rb') as f:
+                pcrs = f.read()
+            
+            logger.info(f"TPM quote generated successfully")
+            logger.debug(f"Quote message length: {len(message)} bytes")
+            logger.debug(f"Quote signature length: {len(signature)} bytes")
+            logger.debug(f"PCR values length: {len(pcrs)} bytes")
+            
+            return {
+                'message': message,
+                'signature': signature,
+                'pcrs': pcrs
+            }
+            
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_quote failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        finally:
+            # Clean up temporary files
+            for tmp_path in [msg_path, sig_path, pcrs_path]:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
+    
+    @staticmethod
+    def generate_sev_quote(nonce: bytes) -> bytes:
+        """
+        Generate SEV-SNP attestation quote for Azure MAA with PCR measurements
+        
+        This implementation:
+        1. Hashes tee_server.py and extends it into PCR 23 (user mode/runtime data)
+        2. Generates a TPM quote including PCR 23 and other relevant PCRs (15, 16, 22)
+        3. Reads the SNP report from TPM NV index using tpm2_nvread
+        4. Extracts the raw 1184-byte SNP report
+        5. Fetches the VCEK certificate chain from Azure THIM endpoint
+        6. Builds the MAA report field format (base64url of JSON containing SnpReport, VcekCertChain, and TPM quote)
+        
+        Args:
+            nonce: Nonce bytes used for TPM quote generation and attestation
             
         Returns:
             Bytes representation of the MAA report field (base64url-encoded JSON string as bytes)
@@ -834,45 +1004,57 @@ class AttestationQuoteGenerator:
             RuntimeError: If tpm2_nvread is not available, TPM read fails, or THIM endpoint is unavailable
             Exception: For other errors during quote generation
         """
-        logger.info("Generating SEV-SNP attestation quote")
+        logger.info("Generating SEV-SNP attestation quote with PCR measurements")
         logger.debug(f"Nonce length: {len(nonce)} bytes")
         
         try:
-            # Hash tee_server.py and extend to PCR23 (recommended for user/runtime data)
-            # PCR23 measurements are cryptographically linked to the SEV-SNP report through AKPub
-            # This follows the recommended approach from Microsoft Learn documentation
+            # Step 1: Hash tee_server.py and extend into PCR 23
             try:
                 # Determine the path to tee_server.py relative to this file
                 current_file = Path(__file__)
                 # Navigate from src/attestation/azure_attestation.py to src/server/tee_server.py
                 tee_server_path = current_file.parent.parent / "server" / "tee_server.py"
-                logger.debug(f"Hashing tee_server.py and extending to PCR23: {tee_server_path}")
-                file_hash = AttestationQuoteGenerator._hash_file_and_extend_to_pcr(str(tee_server_path), pcr_number=23)
+                logger.debug(f"Hashing tee_server.py and extending PCR 23: {tee_server_path}")
+                file_hash = AttestationQuoteGenerator._hash_file_and_extend_pcr(str(tee_server_path), pcr_index=23)
                 file_hash_b64 = AttestationQuoteGenerator._b64_std(file_hash)
                 print(f"TEE_SERVER_HASH_BASE64: {file_hash_b64}")
-                logger.info(f"tee_server.py hash extended to PCR23: {file_hash.hex()}")
+                logger.info(f"tee_server.py hash extended into PCR 23: {file_hash.hex()}")
                 logger.info(f"tee_server.py hash (base64): {file_hash_b64}")
             except Exception as e:
-                logger.warning(f"Failed to hash and extend tee_server.py to PCR23: {e}")
+                logger.warning(f"Failed to hash and extend tee_server.py into PCR: {e}")
                 logger.debug("Continuing with quote generation despite PCR extend failure")
             
-            # Read SNP report from TPM NV index
+            # Step 2: Generate TPM quote with PCR 23 (and other relevant PCRs)
+            tpm_quote = None
+            try:
+                logger.debug("Generating TPM quote with PCRs 15, 16, 22, 23")
+                tpm_quote = AttestationQuoteGenerator._generate_tpm_quote(nonce, pcr_list=[15, 16, 22, 23])
+                logger.info("TPM quote generated successfully")
+            except Exception as e:
+                logger.warning(f"Failed to generate TPM quote: {e}")
+                logger.debug("Continuing with quote generation despite TPM quote failure")
+            
+            # Step 3: Read SNP report from TPM NV index
             logger.debug("Reading SNP report from TPM NV index")
             nv_blob = AttestationQuoteGenerator._read_nv_blob()
             
-            # Extract raw 1184-byte SNP report
+            # Step 4: Extract raw 1184-byte SNP report
             logger.debug("Extracting raw SNP report from NV blob")
             raw_report = AttestationQuoteGenerator._extract_snp_report(nv_blob)
             logger.debug(f"Extracted SNP report, length: {len(raw_report)} bytes")
             
-            # Fetch VCEK certificate chain from Azure THIM endpoint
+            # Step 5: Fetch VCEK certificate chain from Azure THIM endpoint
             logger.debug("Fetching VCEK certificate chain from Azure THIM endpoint")
             vcek_chain_pem = AttestationQuoteGenerator._fetch_vcek_cert_chain_pem()
             logger.debug(f"Fetched VCEK cert chain, length: {len(vcek_chain_pem)} bytes")
             
-            # Build MAA report field (base64url of JSON with SnpReport and VcekCertChain)
+            # Step 6: Build MAA report field (base64url of JSON with SnpReport, VcekCertChain, and optionally TPM quote)
             logger.debug("Building MAA report field")
-            report_field = AttestationQuoteGenerator._build_maa_report_field(raw_report, vcek_chain_pem)
+            report_field = AttestationQuoteGenerator._build_maa_report_field(
+                raw_report, 
+                vcek_chain_pem,
+                tpm_quote=tpm_quote
+            )
             
             # Convert to bytes for return (the report_field is a base64url string)
             quote_bytes = report_field.encode('utf-8')
