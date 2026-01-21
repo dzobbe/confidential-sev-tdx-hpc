@@ -625,6 +625,84 @@ class AttestationQuoteGenerator:
         return digest
     
     @staticmethod
+    def _write_sev_runtime_data(data: bytes = None) -> bytes:
+        """
+        Write SEV runtime data to TPM NV index 0x01400002.
+        
+        This method writes runtime data that can be included in SEV-SNP attestation.
+        Similar to TDX, this writes to NV index 0x01400002.
+        
+        Args:
+            data: Optional runtime data bytes. If None, writes a simple test value (b"1" padded to 64 bytes)
+            
+        Returns:
+            The data bytes that were written
+            
+        Raises:
+            RuntimeError: If tpm2_nvwrite is not available or write fails
+        """
+        logger.debug("Writing SEV runtime data to NV index")
+        
+        # If no data provided, use a simple test value (b"1" padded to 64 bytes)
+        if data is None:
+            # Create 64 bytes of data: b"1" followed by zeros (similar to hash size)
+            runtime_data = b"1" + b"\x00" * 63
+            logger.debug("Using default test runtime data (b'1' padded to 64 bytes)")
+        else:
+            # Ensure data is exactly 64 bytes (pad or truncate if needed)
+            if len(data) < 64:
+                runtime_data = data + b"\x00" * (64 - len(data))
+            elif len(data) > 64:
+                runtime_data = data[:64]
+                logger.warning(f"Runtime data truncated from {len(data)} to 64 bytes")
+            else:
+                runtime_data = data
+        
+        logger.debug(f"Runtime data to write: {runtime_data.hex()}")
+        
+        # Check if tpm2_nvwrite is available
+        if not AttestationQuoteGenerator._have_cmd("tpm2_nvwrite"):
+            raise RuntimeError(
+                "tpm2_nvwrite not found. Install tpm2-tools (e.g., 'sudo apt-get install tpm2-tools')."
+            )
+        
+        # Write runtime data to TPM NV index 0x01400002
+        # Use a temporary file since tpm2_nvwrite requires seekable input
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                tmp_file.write(runtime_data)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                proc = subprocess.run(
+                    [
+                        "tpm2_nvwrite",
+                        "-C", "o",
+                        NV_REPORT_DATA,
+                        "-i", tmp_file_path
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+                logger.info(f"Successfully wrote SEV runtime data to TPM NV index {NV_REPORT_DATA}")
+                logger.debug(f"Runtime data written: {runtime_data.hex()}")
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(tmp_file_path)
+                except Exception:
+                    pass  # Ignore cleanup errors
+        except subprocess.CalledProcessError as e:
+            stderr_msg = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"tpm2_nvwrite failed. You may need elevated permissions (root) or access to /dev/tpmrm0.\n"
+                f"stderr:\n{stderr_msg}"
+            ) from e
+        
+        return runtime_data
+    
+    @staticmethod
     def _extract_mrtd_from_tdx_quote(quote_bytes: bytes) -> Optional[bytes]:
         """
         Extract MRTD (Measurement Register Table Digest) from TDX quote
@@ -739,10 +817,11 @@ class AttestationQuoteGenerator:
         Generate SEV-SNP attestation quote for Azure MAA
         
         This implementation:
-        1. Reads the SNP report from TPM NV index using tpm2_nvread
-        2. Extracts the raw 1184-byte SNP report
-        3. Fetches the VCEK certificate chain from Azure THIM endpoint
-        4. Builds the MAA report field format (base64url of JSON containing SnpReport and VcekCertChain)
+        1. Writes SEV runtime data to TPM NV index 0x01400002 (similar to TDX)
+        2. Reads the SNP report from TPM NV index using tpm2_nvread
+        3. Extracts the raw 1184-byte SNP report
+        4. Fetches the VCEK certificate chain from Azure THIM endpoint
+        5. Builds the MAA report field format (base64url of JSON containing SnpReport and VcekCertChain)
         
         Args:
             nonce: Nonce bytes (currently not used in SNP report extraction, but kept for API compatibility)
@@ -759,6 +838,19 @@ class AttestationQuoteGenerator:
         logger.debug(f"Nonce length: {len(nonce)} bytes")
         
         try:
+            # Write SEV runtime data to NV index before generating quote
+            # Similar to TDX, this writes runtime data that can be included in attestation
+            try:
+                logger.debug("Writing SEV runtime data to NV index")
+                runtime_data = AttestationQuoteGenerator._write_sev_runtime_data()
+                runtime_data_b64 = AttestationQuoteGenerator._b64_std(runtime_data)
+                print(f"SEV_RUNTIME_DATA_BASE64: {runtime_data_b64}")
+                logger.info(f"SEV runtime data written to NV index {NV_REPORT_DATA}: {runtime_data.hex()}")
+                logger.info(f"SEV runtime data (base64): {runtime_data_b64}")
+            except Exception as e:
+                logger.warning(f"Failed to write SEV runtime data to NV index: {e}")
+                logger.debug("Continuing with quote generation despite runtime data write failure")
+            
             # Read SNP report from TPM NV index
             logger.debug("Reading SNP report from TPM NV index")
             nv_blob = AttestationQuoteGenerator._read_nv_blob()
